@@ -1,0 +1,283 @@
+let
+    // ================================
+    // SOURCE DATA
+    // ================================
+    SourceRaw = Excel.CurrentWorkbook(){[Name="Entry Open Orders"]}[Content],
+    Source    = Table.TransformColumnNames(SourceRaw, each Text.Trim(_)),
+
+    ColQty        = "Qty",
+    ColMRP        = "MRP",
+    ColReqDate    = "Requested date",
+    ColCommitDate = "Plan Request Date",
+    BaseWeek      = 24,
+
+    // ================================
+    // CAPACITY TABLE (HORIZONTAL -> VERTICAL)
+    // ================================
+    CapacityRaw  = Excel.CurrentWorkbook(){[Name="Capacity Table"]}[Content],
+    CapacityTrim = Table.TransformColumnNames(CapacityRaw, each Text.Trim(_)),
+
+    // FIX: column is "Line Group" (not "Line Gro")
+    Unpivot =
+        Table.UnpivotOtherColumns(
+            CapacityTrim,
+            {"Line Group"},
+            "Date",
+            "Capacity"
+        ),
+
+    CapacityTypes =
+        Table.TransformColumnTypes(
+            Unpivot,
+            {
+                {"Date",     type date},
+                {"Capacity", type number}
+            }
+        ),
+
+    AddWeek =
+        Table.AddColumn(
+            CapacityTypes,
+            "Week",
+            each Date.WeekOfYear([Date], Day.Monday),
+            Int64.Type
+        ),
+
+    // FIX: rename from "Line Group" (corrected above)
+    Capacity =
+        Table.RenameColumns(
+            AddWeek,
+            {{"Line Group", "LineGroup"}}
+        ),
+
+    // ================================
+    // CLEAN QTY
+    // ================================
+    ToNumber = (x as any) as number =>
+        let t = try Text.Trim(Text.From(x)) otherwise ""
+        in  if t = "" or t = "-" then 0
+            else try Number.From(x) otherwise 0,
+
+    AddQty =
+        Table.AddColumn(
+            Source,
+            "QtyNum",
+            each ToNumber(Record.FieldOrDefault(_, ColQty, 0)),
+            type number
+        ),
+
+    // ================================
+    // LINE GROUP MATCH
+    // FIX: added Text.Upper + Text.Trim for safe matching
+    // ================================
+    AddLineGroup =
+        Table.AddColumn(
+            AddQty,
+            "LineGroup",
+            each
+                let m = Text.Upper(Text.Trim(Text.From(
+                            Record.FieldOrDefault(_, ColMRP, "")
+                        )))
+                in
+                    if List.Contains({"HC8","H3H"}, m) then "HC8_H3H"
+                    else if List.Contains({"H5C","HC9"}, m) then "H5C_HC9"
+                    else if List.Contains({"HC4","A9R"}, m) then "HC4_A9R"
+                    else m,
+            type text
+        ),
+
+    // ================================
+    // PLANNING DATE: Commit Date -> Req. Date fallback
+    // ================================
+    AddPlanningDate =
+        Table.AddColumn(
+            AddLineGroup,
+            "PlanningDate",
+            each
+                let
+                    c = Record.FieldOrDefault(_, ColCommitDate, null),
+                    r = Record.FieldOrDefault(_, ColReqDate,    null)
+                in
+                    if c <> null then c else r,
+            type date
+        ),
+
+    Sorted =
+        Table.Sort(
+            AddPlanningDate,
+            {
+                {"LineGroup",    Order.Ascending},
+                {"PlanningDate", Order.Ascending}
+            }
+        ),
+
+    // ================================
+    // MAIN GROUP LOGIC
+    // ================================
+    Grouped =
+        Table.Group(
+            Sorted,
+            {"LineGroup"},
+            {
+                {
+                    "Rows",
+                    (tbl as table) =>
+                        let
+                            // FIX: added Int64.Type to index column
+                            AddIdx =
+                                Table.AddIndexColumn(tbl, "Idx", 0, 1, Int64.Type),
+
+                            QtyList = List.Transform(AddIdx[QtyNum], each _),
+
+                            // FIX: added type number annotation
+                            AddCumStart =
+                                Table.AddColumn(
+                                    AddIdx,
+                                    "CumStart",
+                                    each List.Sum(List.FirstN(QtyList, [Idx])),
+                                    type number
+                                ),
+
+                            // FIX: added type number annotation
+                            AddCumEnd =
+                                Table.AddColumn(
+                                    AddCumStart,
+                                    "CumEnd",
+                                    each [CumStart] + [QtyNum],
+                                    type number
+                                ),
+
+                            AddSlices =
+                                Table.AddColumn(
+                                    AddCumEnd,
+                                    "Slices",
+                                    each
+                                        let
+                                            qty  = [QtyNum],
+                                            cumS = [CumStart],
+                                            cumE = [CumEnd],
+                                            line = [LineGroup],
+
+                                            // Capacity rows for this LineGroup, sorted by week
+                                            WeeksTable =
+                                                Table.SelectRows(
+                                                    Capacity,
+                                                    (r) => r[LineGroup] = line and r[Week] >= BaseWeek
+                                                ),
+                                            WeeksBuffered =
+                                                Table.Buffer(
+                                                    Table.Sort(WeeksTable, {{"Week", Order.Ascending}})
+                                                ),
+
+                                            CapList  = WeeksBuffered[Capacity],
+                                            WeekList = WeeksBuffered[Week],
+
+                                            // FIX: replaced triple-nested AddCapCum + SelectRows
+                                            // with List.Accumulate (same math, no scoping issues,
+                                            // no O(n^3) penalty, works on non-consecutive weeks)
+                                            CumCaps =
+                                                List.Accumulate(
+                                                    CapList,
+                                                    {},
+                                                    (acc, c) =>
+                                                        acc & {
+                                                            (if List.Count(acc) = 0
+                                                             then 0
+                                                             else List.Last(acc)) + c
+                                                        }
+                                                ),
+
+                                            // iS: first bucket index where CumCaps[i] > cumS
+                                            // mirrors original: wS = first week where CapCum > cumS
+                                            iS =
+                                                let
+                                                    idx = List.PositionOf(
+                                                        List.Transform(CumCaps, each _ > cumS), true
+                                                    )
+                                                in
+                                                    if idx = -1
+                                                    then List.Count(CumCaps) - 1
+                                                    else idx,
+
+                                            // iE: first bucket index where CumCaps[i] >= cumE
+                                            // mirrors original: wE = first week where CapCum >= cumE
+                                            iE =
+                                                let
+                                                    idx = List.PositionOf(
+                                                        List.Transform(CumCaps, each _ >= cumE), true
+                                                    )
+                                                in
+                                                    if idx = -1
+                                                    then List.Count(CumCaps) - 1
+                                                    else idx,
+
+                                            wS = if List.Count(WeekList) > 0 then WeekList{iS} else BaseWeek,
+                                            wE = if List.Count(WeekList) > 0 then WeekList{iE} else BaseWeek,
+
+                                            slices =
+                                                // FIX: guard for empty WeeksBuffered (no capacity rows)
+                                                if qty = 0 or List.Count(WeekList) = 0 then
+                                                    {[
+                                                        ProductionWeek   = BaseWeek,
+                                                        ScheduledQtyBase = 0,
+                                                        SplitFlag        = ""
+                                                    ]}
+                                                else
+                                                    // FIX: iterate over indices {iS..iE} instead of
+                                                    // week numbers {wS..wE} — works correctly even
+                                                    // when weeks are non-consecutive in the table
+                                                    List.Transform(
+                                                        {iS..iE},
+                                                        (i) =>
+                                                            let
+                                                                bucketStart =
+                                                                    if i = 0 then 0
+                                                                    else CumCaps{i - 1},
+                                                                bucketEnd   = CumCaps{i},
+                                                                scheduled   =
+                                                                    List.Max({
+                                                                        0,
+                                                                        List.Min({bucketEnd, cumE}) -
+                                                                        List.Max({bucketStart, cumS})
+                                                                    })
+                                                            in
+                                                                [
+                                                                    ProductionWeek   = WeekList{i},
+                                                                    ScheduledQtyBase = scheduled,
+                                                                    SplitFlag        = if wS <> wE then "SPLIT" else ""
+                                                                ]
+                                                    )
+                                        in
+                                            slices
+                                ),
+
+                            Expand1 = Table.ExpandListColumn(AddSlices, "Slices"),
+                            Expand2 =
+                                Table.ExpandRecordColumn(
+                                    Expand1,
+                                    "Slices",
+                                    {"ProductionWeek","ScheduledQtyBase","SplitFlag"}
+                                ),
+
+                            Clean =
+                                Table.RemoveColumns(Expand2, {"Idx","CumStart","CumEnd"})
+                        in
+                            Clean,
+                    // FIX: added required type table declaration
+                    type table
+                }
+            }
+        ),
+
+    FinalRaw = Table.Combine(Grouped[Rows]),
+
+    Final =
+        Table.AddColumn(
+            FinalRaw,
+            "ScheduledQty",
+            each Number.RoundDown([ScheduledQtyBase], 0),
+            type number
+        )
+
+in
+    Final
