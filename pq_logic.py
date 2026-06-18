@@ -125,6 +125,58 @@ def find_idx(cum_pos, cum_cap_ends):
             return i
     return len(cum_cap_ends) - 1
 
+def _find_first_existing_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    by_lower = {str(c).strip().lower(): c for c in df.columns}
+    for name in candidates:
+        col = by_lower.get(name.strip().lower())
+        if col is not None:
+            return col
+    return None
+
+def _apply_std_pack_multiple_by_part(
+    result: pd.DataFrame,
+    part_candidates: list[str] | None = None,
+    std_pack_candidates: list[str] | None = None,
+) -> pd.DataFrame:
+    if result.empty:
+        result["ExcessCPSAdded"] = []
+        return result
+
+    part_candidates = part_candidates or ["Product code", "Part Number", "Part"]
+    std_pack_candidates = std_pack_candidates or ["Std Pack", "StdPack", "STD PACK"]
+
+    part_col = _find_first_existing_col(result, part_candidates)
+    std_pack_col = _find_first_existing_col(result, std_pack_candidates)
+
+    result["ExcessCPSAdded"] = 0
+
+    # If either column is missing, keep the current schedule untouched.
+    if part_col is None or std_pack_col is None:
+        return result
+
+    # Adjust each part total to the next std-pack multiple and place excess on last row.
+    for part_val, idxs in result.groupby(part_col, sort=False).groups.items():
+        part_rows = result.loc[idxs]
+        std_pack_values = [int(to_number(v)) for v in part_rows[std_pack_col].tolist() if to_number(v) > 0]
+        if not std_pack_values:
+            continue
+
+        std_pack = std_pack_values[0]
+        if std_pack <= 0:
+            continue
+
+        current_total = int(part_rows["ScheduledQty"].sum())
+        adjusted_total = int(math.ceil(current_total / std_pack) * std_pack)
+        excess = max(0, adjusted_total - current_total)
+        if excess == 0:
+            continue
+
+        last_idx = part_rows.index[-1]
+        result.at[last_idx, "ScheduledQty"] = int(result.at[last_idx, "ScheduledQty"]) + excess
+        result.at[last_idx, "ExcessCPSAdded"] = excess
+
+    return result
+
 # ── Core logic ──────────────────────────────────────────────────────
 
 def _process_group(grp, line_group, cap_flat, base_week):
@@ -229,8 +281,15 @@ def run_query(
         lambda q: int(math.floor(q)) if q else 0
     )
 
+    result = _apply_std_pack_multiple_by_part(result)
+
     # ✅ ORDENAR columnas (Line después de LineGroup)
     cols = list(result.columns)
+    if "ExcessCPSAdded" in cols and "ScheduledQty" in cols:
+        cols.remove("ExcessCPSAdded")
+        idx_sched = cols.index("ScheduledQty") + 1
+        cols.insert(idx_sched, "ExcessCPSAdded")
+
     if "Line" in cols and "LineGroup" in cols:
         cols.remove("Line")
         idx = cols.index("LineGroup") + 1
