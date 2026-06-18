@@ -122,6 +122,8 @@ with col_c:
         help="0 = first row is header. Set to 1 if there's a blank row above the headers.",
     )
 
+capacity_line_col = "Line"
+
 # ── Load and preview data ─────────────────────────────────────────────────────
 buf = io.BytesIO(xl_bytes)
 data_df = pd.read_excel(buf, sheet_name=data_sheet)
@@ -140,69 +142,111 @@ if cap_df is not None:
     with st.expander(f"📋 Preview — {cap_sheet}  ({len(cap_df):,} rows)", expanded=False):
         st.dataframe(cap_df, use_container_width=True)
 
-    base_cap_flat = build_cap_flat(cap_df)
+    cap_key_options = [str(c) for c in cap_df.columns]
+    if cap_key_options:
+        default_key_idx = cap_key_options.index("Line") if "Line" in cap_key_options else 0
+        capacity_line_col = st.selectbox(
+            "Capacity key column (must match order Line values)",
+            cap_key_options,
+            index=default_key_idx,
+            help="Choose the capacity column that contains the same line codes as your order Line column.",
+        )
+
+    line_values_hint = set(data_df[col_line].astype(str).str.strip().str.upper().tolist()) if col_line in data_df.columns else None
+    base_cap_flat = build_cap_flat(
+        cap_df,
+        preferred_line_col=capacity_line_col,
+        valid_lines=line_values_hint,
+    )
 
     with st.expander("🔍 Parsed capacity buckets", expanded=False):
         if base_cap_flat:
             cdf = pd.DataFrame(base_cap_flat)
+            if "_LineName" in cdf.columns:
+                cdf["LineLabel"] = cdf["_Line"] + " | " + cdf["_LineName"].astype(str)
+            else:
+                cdf["LineLabel"] = cdf["_Line"]
             st.dataframe(
-                cdf.pivot(index="_Line", columns="_WeekDate", values="_Cap").fillna(0),
+                cdf.pivot(index="LineLabel", columns="_WeekDate", values="_Cap").fillna(0),
                 use_container_width=True,
             )
         else:
             st.warning("No capacity rows parsed. Check that 'Line' column and date headers exist.")
 
-    st.subheader("3 · Scenario simulation (Line + Week override)")
-    sim_help = "Change only selected weeks. Other weeks stay as original capacity."
-    st.caption(sim_help)
+    st.subheader("3 · Scenario simulation (horizontal, like Capacity table)")
+    st.caption("Edit capacities directly in a Line x Week matrix. Only modified cells are treated as overrides.")
 
     if base_cap_flat:
         cdf = pd.DataFrame(base_cap_flat)
-        line_options = sorted(cdf["_Line"].dropna().unique().tolist())
-        week_options = sorted(cdf["_WeekDate"].dropna().unique().tolist())
-    else:
-        line_options = []
-        week_options = []
-
-    sim_seed = pd.DataFrame(
-        {
-            "Line": [line_options[0]] if line_options else [""],
-            "Week": [week_options[0]] if week_options else [pd.NaT],
-            "New Capacity": [0],
-        }
-    )
-
-    sim_df = st.data_editor(
-        sim_seed,
-        key="scenario_overrides",
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={
-            "Line": st.column_config.SelectboxColumn("Line", options=line_options, required=False),
-            "Week": st.column_config.DateColumn("Week", format="YYYY-MM-DD", required=False),
-            "New Capacity": st.column_config.NumberColumn("New Capacity", min_value=0, step=100),
-        },
-    )
-
-    sim_df = sim_df.dropna(subset=["Line", "Week"]) if not sim_df.empty else sim_df
-    sim_df = sim_df[sim_df["New Capacity"].fillna(0) > 0] if not sim_df.empty else sim_df
-
-    adjusted_cap_flat = apply_capacity_overrides(base_cap_flat, sim_df)
-    cmp_df = capacity_comparison(base_cap_flat, adjusted_cap_flat)
-
-    with st.expander("📊 Capacity comparison (Original vs Adjusted vs Delta)", expanded=False):
-        changed = cmp_df[cmp_df["Delta"] != 0].copy()
-        st.dataframe(changed if not changed.empty else cmp_df.head(0), use_container_width=True)
-
-        cmp_pivot = cmp_df.pivot_table(
-            index="Line",
-            columns="Week",
-            values="Adjusted capacity",
-            aggfunc="sum",
-            fill_value=0,
+        line_names = cdf.groupby("_Line")["_LineName"].first().to_dict() if "_LineName" in cdf.columns else {}
+        base_wide = (
+            cdf.pivot_table(index="_Line", columns="_WeekDate", values="_Cap", aggfunc="sum", fill_value=0)
+            .sort_index(axis=0)
+            .sort_index(axis=1)
         )
-        st.caption("Adjusted capacity table")
-        st.dataframe(cmp_pivot, use_container_width=True)
+
+        def _week_label(d):
+            return f"{d.month}/{d.day}/{d.year}"
+
+        week_map = {d: _week_label(d) for d in base_wide.columns}
+        reverse_week_map = {v: k for k, v in week_map.items()}
+
+        matrix_df = base_wide.rename(columns=week_map).reset_index().rename(columns={"_Line": "Line"})
+        matrix_df.insert(1, "Line Name", matrix_df["Line"].map(lambda x: line_names.get(x, x)))
+
+        column_cfg = {
+            "Line": st.column_config.TextColumn("Line", disabled=True),
+            "Line Name": st.column_config.TextColumn("Line Name", disabled=True),
+        }
+        for c in matrix_df.columns:
+            if c not in {"Line", "Line Name"}:
+                column_cfg[c] = st.column_config.NumberColumn(c, min_value=0, step=100)
+
+        edited_matrix = st.data_editor(
+            matrix_df,
+            key="scenario_overrides_horizontal",
+            num_rows="fixed",
+            use_container_width=True,
+            column_config=column_cfg,
+            hide_index=True,
+        )
+
+        # Build override rows from changed cells only.
+        original_long = matrix_df.melt(id_vars=["Line", "Line Name"], var_name="WeekLabel", value_name="Original capacity")
+        edited_long = edited_matrix.melt(id_vars=["Line", "Line Name"], var_name="WeekLabel", value_name="Adjusted capacity")
+
+        compare_long = original_long.merge(edited_long, on=["Line", "Line Name", "WeekLabel"], how="inner")
+        compare_long["Original capacity"] = compare_long["Original capacity"].fillna(0).astype(float)
+        compare_long["Adjusted capacity"] = compare_long["Adjusted capacity"].fillna(0).astype(float)
+        compare_long["Week"] = compare_long["WeekLabel"].map(reverse_week_map)
+        compare_long["Delta"] = compare_long["Adjusted capacity"] - compare_long["Original capacity"]
+
+        changed_long = compare_long[compare_long["Delta"] != 0].copy()
+        sim_df = changed_long[["Line", "Week", "Adjusted capacity"]].rename(
+            columns={"Adjusted capacity": "New Capacity"}
+        )
+
+        adjusted_cap_flat = apply_capacity_overrides(base_cap_flat, sim_df)
+        cmp_df = capacity_comparison(base_cap_flat, adjusted_cap_flat)
+
+        with st.expander("📊 Capacity comparison (Original vs Adjusted vs Delta)", expanded=False):
+            st.dataframe(changed_long[["Line", "Line Name", "Week", "Original capacity", "Adjusted capacity", "Delta"]], use_container_width=True)
+
+            adjusted_pivot = (
+                pd.DataFrame(adjusted_cap_flat)
+                .pivot_table(index="_Line", columns="_WeekDate", values="_Cap", aggfunc="sum", fill_value=0)
+                .sort_index(axis=0)
+                .sort_index(axis=1)
+            )
+            adjusted_pivot = adjusted_pivot.reset_index().rename(columns={"_Line": "Line"})
+            adjusted_pivot.insert(1, "Line Name", adjusted_pivot["Line"].map(lambda x: line_names.get(x, x)))
+            adjusted_pivot = adjusted_pivot.set_index(["Line", "Line Name"])
+            adjusted_pivot = adjusted_pivot.rename(columns=week_map)
+            st.caption("Adjusted capacity table")
+            st.dataframe(adjusted_pivot, use_container_width=True)
+    else:
+        sim_df = pd.DataFrame(columns=["Line", "Week", "New Capacity"])
+        cmp_df = pd.DataFrame(columns=["Line", "Week", "Original capacity", "Adjusted capacity", "Delta"])
 else:
     base_cap_flat = []
     sim_df = pd.DataFrame(columns=["Line", "Week", "New Capacity"])
@@ -224,6 +268,7 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
                 col_req_date=col_req_date,
                 col_commit_date=col_commit_date,
                 col_std_pack=col_std_pack,
+                capacity_line_col=capacity_line_col,
             )
         except Exception as e:
             st.error(f"Error: {e}")
@@ -242,7 +287,7 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
     # ── Summary pivot ─────────────────────────────────────────────────────────
     with st.expander("📊 Summary — Line × Production Week", expanded=True):
         summ = (
-            result.groupby(["Line", "ProductionWeek"], sort=True)
+            result.groupby(["Line", "Line Name", "ProductionWeek"], sort=True)
             .agg(
                 Orders          = ("ScheduledQty", "count"),
                 ScheduledQty    = ("ScheduledQty", "sum"),
@@ -252,7 +297,7 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
         )
         # Pivot for compact view
         pivot = summ.pivot_table(
-            index="Line", columns="ProductionWeek",
+            index=["Line", "Line Name"], columns="ProductionWeek",
             values="ScheduledQty", aggfunc="sum", fill_value=0,
         )
         st.dataframe(pivot, use_container_width=True)

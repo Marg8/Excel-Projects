@@ -54,7 +54,17 @@ def normalize_line(x) -> str | None:
     if x is None:
         return None
     t = str(x).strip().upper()
-    return t if t else None
+    if not t:
+        return None
+
+    # Keep planning keyed by standard codes used in capacity.
+    if t in {"HC8", "H3H"}:
+        return "HC8_H3H"
+    if t in {"H5C", "HC9"}:
+        return "H5C_HC9"
+    if t in {"HC4", "A9R"}:
+        return "HC4_A9R"
+    return t
 
 
 def _find_first_existing_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -82,15 +92,57 @@ def _round_up_to_std_pack(order_qty: float, std_pack: float) -> tuple[float, flo
 
 # ── Capacity parsing / simulation ────────────────────────────────────────────
 
+def _choose_capacity_line_column(
+    df: pd.DataFrame,
+    preferred_line_col: str | None = None,
+    line_col_candidates: list[str] | None = None,
+    valid_lines: set[str] | None = None,
+) -> str:
+    cols = list(df.columns)
+
+    base_candidates = line_col_candidates or ["Line", "Line Grp", "Line Group", "LineGroup", "MRP"]
+    candidates = []
+    if preferred_line_col:
+        candidates.append(preferred_line_col)
+    candidates.extend(base_candidates)
+
+    existing = []
+    by_lower = {str(c).strip().lower(): c for c in cols}
+    for c in candidates:
+        col = by_lower.get(str(c).strip().lower())
+        if col is not None and col not in existing:
+            existing.append(col)
+
+    if not existing:
+        return cols[0]
+
+    if not valid_lines:
+        return existing[0]
+
+    best_col = existing[0]
+    best_score = -1
+    for c in existing:
+        vals = set(normalize_line(v) for v in df[c].tolist())
+        vals.discard(None)
+        score = len(vals.intersection(valid_lines))
+        if score > best_score:
+            best_col = c
+            best_score = score
+
+    return best_col
+
+
 def build_cap_flat(
     capacity_df: pd.DataFrame | None,
     line_col_candidates: list[str] | None = None,
+    preferred_line_col: str | None = None,
+    valid_lines: set[str] | None = None,
 ) -> list[dict]:
     """
     Build long-form capacity rows from wide table:
       Line | 6/8/2026 | 6/15/2026 | ...
-    Returns sorted rows with keys:
-      _Line, _WeekDate, _WkNum, _Cap
+        Returns sorted rows with keys:
+            _Line, _LineName, _WeekDate, _WkNum, _Cap
     """
     if capacity_df is None or capacity_df.empty:
         return []
@@ -103,10 +155,15 @@ def build_cap_flat(
         df = df.iloc[1:].reset_index(drop=True)
 
     cols = list(df.columns)
-    line_col_candidates = line_col_candidates or ["Line", "Production Line"]
-    line_col = _find_first_existing_col(df, line_col_candidates)
-    if line_col is None:
-        line_col = cols[0]
+    line_col = _choose_capacity_line_column(
+        df,
+        preferred_line_col=preferred_line_col,
+        line_col_candidates=(line_col_candidates or ["Line", "Line Grp", "Line Group", "LineGroup", "Production Line"]),
+        valid_lines=valid_lines,
+    )
+    line_name_col = _find_first_existing_col(df, ["Line", "Line Name", "Line Description", "Description"])
+    if line_name_col is None:
+        line_name_col = line_col
 
     date_cols = [c for c in cols if c != line_col and to_date(c) is not None]
 
@@ -115,6 +172,10 @@ def build_cap_flat(
         line_key = normalize_line(row.get(line_col))
         if not line_key:
             continue
+        line_name_raw = row.get(line_name_col)
+        line_name = str(line_name_raw).strip() if line_name_raw is not None else ""
+        if not line_name:
+            line_name = line_key
 
         for dc in date_cols:
             cap = to_number(row.get(dc, 0))
@@ -128,6 +189,7 @@ def build_cap_flat(
             rows.append(
                 {
                     "_Line": line_key,
+                    "_LineName": line_name,
                     "_WeekDate": week_date,
                     "_WkNum": int(week_date.isocalendar()[1]),
                     "_Cap": cap,
@@ -180,6 +242,7 @@ def apply_capacity_overrides(
                 base.append(
                     {
                         "_Line": line_key,
+                        "_LineName": line_key,
                         "_WeekDate": week_date,
                         "_WkNum": int(week_date.isocalendar()[1]),
                         "_Cap": new_cap,
@@ -195,19 +258,25 @@ def capacity_comparison(original_cap_flat: list[dict], adjusted_cap_flat: list[d
     a = pd.DataFrame(adjusted_cap_flat)
 
     if o.empty:
-        o = pd.DataFrame(columns=["_Line", "_WeekDate", "_Cap"])
+        o = pd.DataFrame(columns=["_Line", "_LineName", "_WeekDate", "_Cap"])
     if a.empty:
-        a = pd.DataFrame(columns=["_Line", "_WeekDate", "_Cap"])
+        a = pd.DataFrame(columns=["_Line", "_LineName", "_WeekDate", "_Cap"])
 
-    o = o.rename(columns={"_Cap": "Original capacity"})[["_Line", "_WeekDate", "Original capacity"]]
-    a = a.rename(columns={"_Cap": "Adjusted capacity"})[["_Line", "_WeekDate", "Adjusted capacity"]]
+    if "_LineName" not in o.columns:
+        o["_LineName"] = o.get("_Line")
+    if "_LineName" not in a.columns:
+        a["_LineName"] = a.get("_Line")
+
+    o = o.rename(columns={"_Cap": "Original capacity", "_LineName": "Original Line Name"})[["_Line", "Original Line Name", "_WeekDate", "Original capacity"]]
+    a = a.rename(columns={"_Cap": "Adjusted capacity", "_LineName": "Adjusted Line Name"})[["_Line", "Adjusted Line Name", "_WeekDate", "Adjusted capacity"]]
 
     cmp_df = o.merge(a, on=["_Line", "_WeekDate"], how="outer")
     cmp_df["Original capacity"] = cmp_df["Original capacity"].fillna(0)
     cmp_df["Adjusted capacity"] = cmp_df["Adjusted capacity"].fillna(0)
+    cmp_df["Line Name"] = cmp_df["Adjusted Line Name"].fillna(cmp_df["Original Line Name"]).fillna(cmp_df["_Line"])
     cmp_df["Delta"] = cmp_df["Adjusted capacity"] - cmp_df["Original capacity"]
     cmp_df = cmp_df.rename(columns={"_Line": "Line", "_WeekDate": "Week"})
-    return cmp_df.sort_values(["Line", "Week"]).reset_index(drop=True)
+    return cmp_df[["Line", "Line Name", "Week", "Original capacity", "Adjusted capacity", "Delta"]].sort_values(["Line", "Week"]).reset_index(drop=True)
 
 
 # ── Scheduling core ──────────────────────────────────────────────────────────
@@ -221,12 +290,20 @@ def get_buckets(line_key: str, cap_flat: list[dict], base_week: int):
                 "Week": r["_WkNum"],
                 "WeekDate": r["_WeekDate"],
                 "Cap": r["_Cap"],
+                "LineName": r.get("_LineName", r["_Line"]),
             }
             for r in rows
         ]
 
-    fallback = float(DEFAULT_CAPS.get(line_key, 1))
-    return [{"Week": base_week, "WeekDate": None, "Cap": fallback}]
+    if line_key in DEFAULT_CAPS:
+        fallback = float(DEFAULT_CAPS[line_key])
+    elif cap_flat:
+        # Prevent pathological very slow runs when line keys do not match and fallback=1.
+        fallback = float(pd.Series([r["_Cap"] for r in cap_flat]).median())
+    else:
+        fallback = 1.0
+    fallback = max(1.0, fallback)
+    return [{"Week": base_week, "WeekDate": None, "Cap": fallback, "LineName": line_key}]
 
 
 def find_idx(cum_pos, cum_cap_ends):
@@ -256,6 +333,7 @@ def _process_group(grp, line_key, cap_flat, base_week):
             "Week": last_week + n,
             "WeekDate": (last_week_date + timedelta(days=7 * n)) if last_week_date is not None else None,
             "Cap": last_cap,
+            "LineName": raw_buckets[-1].get("LineName", line_key),
         }
         for n in range(1, extra_n + 1)
     ]
@@ -291,6 +369,7 @@ def _process_group(grp, line_key, cap_flat, base_week):
                 {
                     **row,
                     "Line": line_key,
+                    "Line Name": ext_buckets[i].get("LineName", line_key),
                     "ProductionWeek": week_nums[i],
                     "ProductionWeekDate": week_dates[i],
                     "ScheduledQtyBase": scheduled_qty,
@@ -315,6 +394,7 @@ def run_query(
     col_req_date=DEFAULT_COL_REQ_DATE,
     col_commit_date=DEFAULT_COL_COMMIT_DATE,
     col_std_pack=DEFAULT_COL_STD_PACK,
+    capacity_line_col="Line",
 ):
     df = data_df.copy()
     df.columns = [str(c).strip() for c in df.columns]
@@ -341,7 +421,12 @@ def run_query(
     df["PlanningDate"] = df.apply(_plan_date, axis=1)
     df = df.sort_values(["Line", "PlanningDate"], na_position="last").reset_index(drop=True)
 
-    base_cap_flat = build_cap_flat(capacity_df)
+    valid_lines = set(df["Line"].dropna().tolist())
+    base_cap_flat = build_cap_flat(
+        capacity_df,
+        preferred_line_col=capacity_line_col,
+        valid_lines=valid_lines,
+    )
     cap_flat = apply_capacity_overrides(base_cap_flat, capacity_overrides_df)
 
     parts = []
@@ -360,6 +445,11 @@ def run_query(
         cols.remove("Excess Std Pack")
         idx_sched = cols.index("ScheduledQty") + 1
         cols.insert(idx_sched, "Excess Std Pack")
+
+    if "Line Name" in cols and "Line" in cols:
+        cols.remove("Line Name")
+        idx_line = cols.index("Line") + 1
+        cols.insert(idx_line, "Line Name")
 
     result = result[cols]
     return result
