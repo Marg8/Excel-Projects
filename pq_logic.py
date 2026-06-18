@@ -123,19 +123,34 @@ def build_cost_lookup(
     cost_df: pd.DataFrame | None,
     pn_col: str = "PN",
     cost_col: str = DEFAULT_COL_COST,
+    date_col: str = "Last update",
 ) -> dict[str, float]:
-    """Returns {PartNumber -> StdCost}."""
+    """
+    Returns {PartNumber -> StdCost} using the most recent non-zero cost.
+    Progressive fallback: if the latest update date has a zero/null cost for a
+    part, the previous available record is used automatically.
+    """
     if cost_df is None or cost_df.empty:
         return {}
     df = cost_df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     p_col = _find_first_existing_col(df, [pn_col, DEFAULT_COL_MATERIAL, "Material", "Part"])
     c_col = _find_first_existing_col(df, [cost_col, "Std Cost", "StdCost", "Cost"])
+    d_col = _find_first_existing_col(df, [date_col, "Last update", "Update Date", "Date"])
     if p_col is None or c_col is None:
         return {}
     df["_pn"]   = df[p_col].astype(str).str.strip()
-    df["_cost"] = df[c_col].apply(to_number)
-    return df.set_index("_pn")["_cost"].to_dict()
+    df["_cost"] = pd.to_numeric(df[c_col], errors="coerce")
+    df["_date"] = (
+        pd.to_datetime(df[d_col], errors="coerce")
+        if d_col
+        else pd.Timestamp("1900-01-01")
+    )
+    # Keep valid positive costs; sort descending so first per group = most recent
+    valid = df[df["_cost"].notna() & (df["_cost"] > 0)].copy()
+    valid = valid.sort_values("_date", ascending=False)
+    best  = valid.groupby("_pn", sort=False).first().reset_index()
+    return best.set_index("_pn")["_cost"].to_dict()
 
 
 def build_std_pack_lookup(

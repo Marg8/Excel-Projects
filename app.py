@@ -25,6 +25,17 @@ from pq_logic import (
     capacity_comparison,
     run_query,
 )
+from bom_analysis import (
+    build_cost_lookup_dated,
+    cost_date_summary,
+    parse_bom,
+    explode_bom_demand,
+    component_demand_pivot,
+    compute_build_capability,
+    build_capability_summary,
+    shortage_report,
+    run_build_analysis,
+)
 
 WORKSPACE_FILE  = "MPS.xlsx"
 DEFAULT_DATA_SHEET = "Entry Open Orders"
@@ -33,6 +44,7 @@ DEFAULT_CAP_HEADER = 1   # blank row above headers in MPS.xlsx
 DEFAULT_HRS_SHEET  = "Hrs"
 DEFAULT_COST_SHEET = "Cost"
 DEFAULT_SP_SHEET   = "Std Pack"
+DEFAULT_BOM_SHEET  = "BOM"
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -40,6 +52,29 @@ st.set_page_config(
     page_icon="🏭",
     layout="wide",
 )
+
+# ── Global CSS ────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+a { text-decoration: none; color: #464feb; }
+tr th, tr td { border: 1px solid #e6e6e6; }
+tr th { background-color: #f5f5f5; }
+[data-testid="metric-container"] {
+    background: #f8f9ff;
+    border: 1px solid #e0e4ff;
+    border-radius: 8px;
+    padding: 8px 12px;
+}
+[data-testid="metric-container"] label { color: #555; font-size: 12px; }
+.section-header {
+    background: linear-gradient(90deg, #464feb15, transparent);
+    border-left: 4px solid #464feb;
+    padding: 6px 14px;
+    border-radius: 0 6px 6px 0;
+    margin-bottom: 12px;
+}
+</style>
+""", unsafe_allow_html=True)
 
 st.title("🏭 MPS – Capacity Schedule Tester")
 
@@ -150,6 +185,14 @@ with col_f:
         index=_idx(sp_options, DEFAULT_SP_SHEET, "Std Pack", "StdPack"),
     )
 
+col_g, _, _ = st.columns(3)
+with col_g:
+    bom_options = ["(none)"] + sheet_names
+    bom_sheet = st.selectbox(
+        "BOM sheet", bom_options,
+        index=_idx(bom_options, DEFAULT_BOM_SHEET, "BOM", "Bill of Materials"),
+    )
+
 capacity_line_col = "Line"
 
 # ── Load and preview data ─────────────────────────────────────────────────────
@@ -171,6 +214,9 @@ cost_df = pd.read_excel(buf, sheet_name=cost_sheet) if cost_sheet != "(none)" el
 
 buf = io.BytesIO(xl_bytes)
 sp_master_df = pd.read_excel(buf, sheet_name=sp_master_sheet) if sp_master_sheet != "(none)" else None
+
+buf = io.BytesIO(xl_bytes)
+bom_df = pd.read_excel(buf, sheet_name=bom_sheet) if bom_sheet != "(none)" else None
 
 with st.expander(f"📋 Preview — {data_sheet}  ({len(data_df):,} rows)", expanded=False):
     st.dataframe(data_df.head(100), use_container_width=True)
@@ -477,6 +523,334 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
+
+    # ── Section 6: Build Analysis ─────────────────────────────────────────────
+    st.divider()
+    st.subheader("6 · Build Analysis (BOM-based)")
+    st.caption(
+        "Explodes the MPS schedule through the BOM to show component demand, "
+        "raw material coverage, and build capability (FG output). "
+        "Enter available stock to activate shortage and buildable-qty calculations."
+    )
+
+    if bom_df is None:
+        st.info("Select a BOM sheet above to enable Build Analysis.")
+    else:
+        with st.spinner("Parsing BOM and exploding demand…"):
+            cost_dated_lookup = build_cost_lookup_dated(cost_df)
+            bom_clean = parse_bom(bom_df, alt_bom=1, bom_level=1)
+            exploded_base = explode_bom_demand(
+                result, bom_clean,
+                fg_col="Product code",
+                qty_col="ScheduledQty",
+            )
+
+        if exploded_base.empty:
+            matched_fgs = set(bom_clean["Material"].astype(str)) & set(
+                result["Product code"].astype(str) if "Product code" in result.columns else set()
+            )
+            st.warning(
+                f"BOM parsed ({len(bom_clean):,} components from "
+                f"{bom_clean['Material'].nunique():,} assemblies) but no orders "
+                f"matched BOM materials. Matched FGs: {len(matched_fgs)}"
+            )
+        else:
+            # ── BOM stats ─────────────────────────────────────────────────────
+            n_fgs  = exploded_base["FG"].nunique()
+            n_comp = exploded_base["Component"].nunique()
+            total_demand = exploded_base["Comp_Demand"].sum()
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Matched FGs",        f"{n_fgs:,}")
+            m2.metric("Unique Components",  f"{n_comp:,}")
+            m3.metric("BOM Rows",           f"{len(bom_clean):,}")
+            m4.metric("Total Comp. Demand", f"{total_demand:,.0f}")
+
+            # ── Tabs ──────────────────────────────────────────────────────────
+            tab_demand, tab_stock, tab_capability, tab_cost = st.tabs([
+                "📦 Component Demand",
+                "🏷️ Stock Input & Shortage",
+                "🏗️ Build Capability (FG Output)",
+                "💰 Cost Traceability",
+            ])
+
+            # ── Tab 1: Component demand pivot ─────────────────────────────────
+            with tab_demand:
+                st.markdown("**Raw material demand by production week** — exploded through BOM")
+                demand_pvt = component_demand_pivot(exploded_base, week_col="ProductionWeek")
+                if not demand_pvt.empty:
+                    week_cols = [c for c in demand_pvt.columns
+                                 if c not in ("Component", "Component_Desc", "Total")]
+                    fmt = {c: "{:,.0f}" for c in week_cols + ["Total"]}
+                    st.dataframe(
+                        demand_pvt.style.format(fmt).background_gradient(
+                            subset=["Total"], cmap="YlOrRd"
+                        ),
+                        use_container_width=True, height=420,
+                    )
+
+                    with st.expander("📄 Full exploded demand (row-level)", expanded=False):
+                        disp_cols = [c for c in [
+                            "FG", "FG_Desc", "Component", "Component_Desc",
+                            "BOM_Usage", "FG_Qty", "Comp_Demand",
+                            "ProductionWeek", "ProductionWeekDate", "Line", "Line Name",
+                        ] if c in exploded_base.columns]
+                        st.dataframe(exploded_base[disp_cols], use_container_width=True)
+
+                    buf_demand = io.BytesIO()
+                    with pd.ExcelWriter(buf_demand, engine="openpyxl") as w:
+                        demand_pvt.to_excel(w, sheet_name="Component Demand", index=False)
+                        exploded_base.to_excel(w, sheet_name="Exploded Detail", index=False)
+                    st.download_button(
+                        "⬇️ Component Demand Excel",
+                        data=buf_demand.getvalue(),
+                        file_name="component_demand.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+
+            # ── Tab 2: Stock input & shortage ──────────────────────────────────
+            with tab_stock:
+                st.markdown(
+                    "**Enter available stock for each component.** "
+                    "Leave as 0 to see maximum demand (no coverage)."
+                )
+
+                # Build stock input table pre-populated with total demand
+                comp_demand_totals = (
+                    exploded_base.groupby(["Component", "Component_Desc"])["Comp_Demand"]
+                    .sum().reset_index()
+                    .rename(columns={"Comp_Demand": "Total_Demand"})
+                    .sort_values("Total_Demand", ascending=False)
+                )
+                comp_demand_totals["Available_Qty"] = 0.0
+                comp_demand_totals["Total_Demand"] = comp_demand_totals["Total_Demand"].round(2)
+
+                stock_edited = st.data_editor(
+                    comp_demand_totals[["Component", "Component_Desc", "Total_Demand", "Available_Qty"]],
+                    key="stock_input_table",
+                    num_rows="fixed",
+                    use_container_width=True,
+                    column_config={
+                        "Component":       st.column_config.TextColumn("Component", disabled=True),
+                        "Component_Desc":  st.column_config.TextColumn("Description", disabled=True),
+                        "Total_Demand":    st.column_config.NumberColumn("Total Demand", disabled=True, format="%.2f"),
+                        "Available_Qty":   st.column_config.NumberColumn("Available Qty", min_value=0, format="%.0f"),
+                    },
+                    hide_index=True,
+                )
+
+                stock_lookup_user = dict(
+                    zip(stock_edited["Component"].astype(str), stock_edited["Available_Qty"].fillna(0))
+                )
+                has_stock_input = stock_edited["Available_Qty"].sum() > 0
+
+                if has_stock_input:
+                    enriched = compute_build_capability(exploded_base, stock_lookup_user)
+
+                    short_df = shortage_report(enriched, week_col="ProductionWeek")
+                    if not short_df.empty:
+                        st.markdown("#### ⚠️ Shortage Summary — Components × Week")
+                        week_cols_s = [c for c in short_df.columns
+                                       if c not in ("Component", "Component_Desc", "Total Shortage")]
+                        fmt_s = {c: "{:,.0f}" for c in week_cols_s + ["Total Shortage"]}
+                        st.dataframe(
+                            short_df.style.format(fmt_s).background_gradient(
+                                subset=["Total Shortage"], cmap="Reds"
+                            ),
+                            use_container_width=True,
+                        )
+                    else:
+                        st.success("✅ No shortages — all component demand is covered by available stock.")
+                else:
+                    st.info("Enter available quantities above and the shortage analysis will appear here.")
+
+            # ── Tab 3: Build capability ────────────────────────────────────────
+            with tab_capability:
+                st.markdown("**Buildable FG quantity per part per week** — limited by most constrained component")
+
+                has_stock_cap = st.session_state.get("stock_input_table") is not None and (
+                    sum(
+                        (v.get("Available_Qty") or 0)
+                        for v in (st.session_state.get("stock_input_table", {}).get("edited_rows", {}).values())
+                    ) > 0
+                ) if "stock_input_table" in st.session_state else False
+
+                # Always compute capability — with user stock if provided, otherwise FG qty
+                cap_lookup = stock_lookup_user if has_stock_input else {}
+                if has_stock_input:
+                    enriched_cap = compute_build_capability(exploded_base, cap_lookup)
+                else:
+                    enriched_cap = exploded_base.copy()
+
+                capability_df = build_capability_summary(
+                    enriched_cap, cost_dated_lookup,
+                    has_stock=has_stock_input,
+                )
+
+                if not capability_df.empty:
+                    # Summary metrics
+                    total_buildable = capability_df["Buildable_Qty"].sum()
+                    total_scheduled = capability_df["FG_Scheduled_Qty"].sum()
+                    total_cost      = capability_df["Total_Cost"].sum() if "Total_Cost" in capability_df.columns else 0
+                    avg_coverage    = capability_df["Material_Coverage_Pct"].mean()
+
+                    ca, cb, cc, cd = st.columns(4)
+                    ca.metric("Total Scheduled Qty", f"{total_scheduled:,.0f}")
+                    cb.metric("Total Buildable Qty",  f"{total_buildable:,.0f}",
+                              delta=f"{total_buildable-total_scheduled:+,.0f}" if has_stock_input else None)
+                    cc.metric("Avg Coverage %",       f"{avg_coverage:.1f}%")
+                    cd.metric("Total Cost",           f"${total_cost:,.0f}")
+
+                    # Pivot: FG × Week buildable qty
+                    pn_col_cap = "Part_Number" if "Part_Number" in capability_df.columns else capability_df.columns[0]
+                    week_col_cap = "ProductionWeek" if "ProductionWeek" in capability_df.columns else None
+
+                    if week_col_cap and pn_col_cap in capability_df.columns:
+                        buildable_pvt = capability_df.pivot_table(
+                            index=[pn_col_cap],
+                            columns=week_col_cap,
+                            values="Buildable_Qty",
+                            aggfunc="sum",
+                            fill_value=0,
+                        )
+                        buildable_pvt["Total"] = buildable_pvt.sum(axis=1)
+                        st.markdown("##### Buildable Qty — FG × Production Week")
+                        bld_fmt = {c: "{:,.0f}" for c in buildable_pvt.columns}
+                        st.dataframe(
+                            buildable_pvt.style.format(bld_fmt).background_gradient(
+                                cmap="Greens" if not has_stock_input else "RdYlGn"
+                            ),
+                            use_container_width=True, height=400,
+                        )
+
+                    # Full detail table
+                    with st.expander("📄 Full capability dataset (dashboard-ready)", expanded=False):
+                        display_cols = [c for c in [
+                            "Part_Number", "FG_Description",
+                            "Line", "Line Name", "ProductionWeek", "ProductionWeekDate",
+                            "Quarter", "Month Name",
+                            "FG_Scheduled_Qty", "Buildable_Qty", "Material_Coverage_Pct",
+                            "Constraint_Component", "Constraint_Desc",
+                            "Num_BOM_Components", "Total_Shortage",
+                            "Std_Cost", "Cost_Effective_Date", "Total_Cost",
+                        ] if c in capability_df.columns]
+                        st.dataframe(capability_df[display_cols], use_container_width=True)
+
+                    # Coverage heatmap pivot
+                    if has_stock_input and week_col_cap:
+                        with st.expander("🗺️ Material Coverage % heatmap — FG × Week", expanded=True):
+                            cov_pvt = capability_df.pivot_table(
+                                index=[pn_col_cap],
+                                columns=week_col_cap,
+                                values="Material_Coverage_Pct",
+                                aggfunc="min",
+                                fill_value=0,
+                            )
+                            st.dataframe(
+                                cov_pvt.style.format("{:.1f}%").background_gradient(
+                                    cmap="RdYlGn", vmin=0, vmax=100
+                                ),
+                                use_container_width=True, height=400,
+                            )
+
+                        # Bottleneck components
+                        if "Constraint_Component" in capability_df.columns:
+                            bottlenecks = (
+                                capability_df[capability_df["Constraint_Component"].notna()]
+                                .groupby("Constraint_Component")
+                                .agg(
+                                    Description=("Constraint_Desc", "first"),
+                                    Affected_FGs=("Part_Number", "nunique"),
+                                    Min_Coverage=("Material_Coverage_Pct", "min"),
+                                    Total_Shortage=("Total_Shortage", "sum"),
+                                )
+                                .sort_values("Min_Coverage")
+                                .reset_index()
+                            )
+                            if not bottlenecks.empty:
+                                st.markdown("#### 🔴 Bottleneck Components")
+                                st.dataframe(
+                                    bottlenecks.style.format({
+                                        "Min_Coverage": "{:.1f}%",
+                                        "Total_Shortage": "{:,.0f}",
+                                    }).background_gradient(subset=["Min_Coverage"], cmap="RdYlGn", vmin=0, vmax=100),
+                                    use_container_width=True,
+                                )
+
+                    # Download
+                    buf_cap = io.BytesIO()
+                    with pd.ExcelWriter(buf_cap, engine="openpyxl") as w:
+                        capability_df.to_excel(w, sheet_name="Build Capability", index=False)
+                        if has_stock_input and not shortage_report(enriched_cap).empty:
+                            shortage_report(enriched_cap).to_excel(w, sheet_name="Shortage Report", index=False)
+                        demand_pvt = component_demand_pivot(exploded_base)
+                        if not demand_pvt.empty:
+                            demand_pvt.to_excel(w, sheet_name="Component Demand", index=False)
+                    st.download_button(
+                        "⬇️ Build Analysis Excel",
+                        data=buf_cap.getvalue(),
+                        file_name="build_analysis.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+
+            # ── Tab 4: Cost traceability ───────────────────────────────────────
+            with tab_cost:
+                st.markdown(
+                    "**Standard Cost — most recent record per part** with traceability to the "
+                    "source update date. Parts not in the latest update automatically fall back "
+                    "to the previous available date (progressive fallback)."
+                )
+                if cost_dated_lookup:
+                    n_dated    = len(cost_dated_lookup)
+                    dates_used = {}
+                    for info in cost_dated_lookup.values():
+                        d = info.get("date", "unknown")
+                        dates_used[d] = dates_used.get(d, 0) + 1
+
+                    t1, t2 = st.columns(2)
+                    t1.metric("Parts with cost data", f"{n_dated:,}")
+                    with t2:
+                        st.caption("Records by update date used:")
+                        for d, cnt in sorted(dates_used.items(), reverse=True):
+                            st.write(f"  `{d}` → {cnt:,} parts")
+
+                    cost_trace = cost_date_summary(cost_df, cost_dated_lookup)
+                    if not cost_trace.empty:
+                        # Filter to parts in the current scheduled result
+                        if "Product code" in result.columns:
+                            scheduled_pns = set(result["Product code"].astype(str).str.strip())
+                            cost_trace_filtered = cost_trace[cost_trace["Part Number"].isin(scheduled_pns)]
+                            other_count = len(cost_trace) - len(cost_trace_filtered)
+                            if not cost_trace_filtered.empty:
+                                st.markdown("**Cost traceability for scheduled parts:**")
+                                st.dataframe(
+                                    cost_trace_filtered.style.format({"Std Cost Used": "${:.4f}"}),
+                                    use_container_width=True, height=360,
+                                )
+                                if other_count > 0:
+                                    with st.expander(f"Show all {len(cost_trace):,} parts with cost data"):
+                                        st.dataframe(
+                                            cost_trace.style.format({"Std Cost Used": "${:.4f}"}),
+                                            use_container_width=True,
+                                        )
+                        else:
+                            st.dataframe(
+                                cost_trace.style.format({"Std Cost Used": "${:.4f}"}),
+                                use_container_width=True,
+                            )
+
+                        buf_cost = io.BytesIO()
+                        with pd.ExcelWriter(buf_cost, engine="openpyxl") as w:
+                            cost_trace.to_excel(w, sheet_name="Cost Traceability", index=False)
+                        st.download_button(
+                            "⬇️ Cost Traceability Excel",
+                            data=buf_cost.getvalue(),
+                            file_name="cost_traceability.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        )
+                else:
+                    st.info("No Cost sheet loaded — select the Cost sheet in Section 2.")
 
 # ── M code viewer ─────────────────────────────────────────────────────────────
 with st.expander("📝 Current M code (Excel.xlsx)", expanded=False):
