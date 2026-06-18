@@ -18,6 +18,10 @@ from pq_logic import (
     DEFAULT_COL_STD_PACK,
     apply_capacity_overrides,
     build_cap_flat,
+    build_hrs_lookup,
+    build_cost_lookup,
+    build_std_pack_lookup,
+    build_ma3_summary,
     capacity_comparison,
     run_query,
 )
@@ -26,6 +30,9 @@ WORKSPACE_FILE  = "MPS.xlsx"
 DEFAULT_DATA_SHEET = "Entry Open Orders"
 DEFAULT_CAP_SHEET  = "Capacity Table"
 DEFAULT_CAP_HEADER = 1   # blank row above headers in MPS.xlsx
+DEFAULT_HRS_SHEET  = "Hrs"
+DEFAULT_COST_SHEET = "Cost"
+DEFAULT_SP_SHEET   = "Std Pack"
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -122,6 +129,27 @@ with col_c:
         help="0 = first row is header. Set to 1 if there's a blank row above the headers.",
     )
 
+# Master-table sheets
+col_d, col_e, col_f = st.columns(3)
+with col_d:
+    hrs_options = ["(none)"] + sheet_names
+    hrs_sheet = st.selectbox(
+        "Hrs sheet", hrs_options,
+        index=_idx(hrs_options, DEFAULT_HRS_SHEET, "Hrs", "Hours"),
+    )
+with col_e:
+    cost_options = ["(none)"] + sheet_names
+    cost_sheet = st.selectbox(
+        "Cost sheet", cost_options,
+        index=_idx(cost_options, DEFAULT_COST_SHEET, "Cost"),
+    )
+with col_f:
+    sp_options = ["(none)"] + sheet_names
+    sp_master_sheet = st.selectbox(
+        "Std Pack master sheet", sp_options,
+        index=_idx(sp_options, DEFAULT_SP_SHEET, "Std Pack", "StdPack"),
+    )
+
 capacity_line_col = "Line"
 
 # ── Load and preview data ─────────────────────────────────────────────────────
@@ -134,6 +162,15 @@ cap_df = (
     if cap_sheet != "(none)"
     else None
 )
+
+buf = io.BytesIO(xl_bytes)
+hrs_df = pd.read_excel(buf, sheet_name=hrs_sheet) if hrs_sheet != "(none)" else None
+
+buf = io.BytesIO(xl_bytes)
+cost_df = pd.read_excel(buf, sheet_name=cost_sheet) if cost_sheet != "(none)" else None
+
+buf = io.BytesIO(xl_bytes)
+sp_master_df = pd.read_excel(buf, sheet_name=sp_master_sheet) if sp_master_sheet != "(none)" else None
 
 with st.expander(f"📋 Preview — {data_sheet}  ({len(data_df):,} rows)", expanded=False):
     st.dataframe(data_df.head(100), use_container_width=True)
@@ -269,6 +306,9 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
                 col_commit_date=col_commit_date,
                 col_std_pack=col_std_pack,
                 capacity_line_col=capacity_line_col,
+                hrs_df=hrs_df,
+                cost_df=cost_df,
+                sp_df=sp_master_df,
             )
         except Exception as e:
             st.error(f"Error: {e}")
@@ -339,6 +379,104 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
         mime="text/csv",
         use_container_width=True,
     )
+
+    # ── MA3 Summary ───────────────────────────────────────────────────────────
+    st.subheader("5 · MA3 Summary")
+    st.caption("Pieces / Hours / Value by Line × Quarter × Month, based on ProductionWeekDate")
+
+    if "Quarter" not in result.columns or "Month Name" not in result.columns:
+        st.info("Date dimensions not available — ProductionWeekDate column required.")
+    elif "Line Name" not in result.columns:
+        st.info("Line Name column not found in result.")
+    else:
+        # Build quarterly + monthly totals
+        def _ma3_section(label, metric_col, fmt_fn):
+            if metric_col not in result.columns:
+                st.warning(f"Column '{metric_col}' not in results.")
+                return
+            st.markdown(f"**{label}**")
+            try:
+                sub = result[result[metric_col].notna()].copy()
+                sub[metric_col] = pd.to_numeric(sub[metric_col], errors="coerce").fillna(0)
+
+                # Line × Month pivot
+                monthly_pvt = sub.pivot_table(
+                    index=["Line", "Line Name"],
+                    columns="Month Name",
+                    values=metric_col,
+                    aggfunc="sum",
+                    fill_value=0,
+                )
+                # Reorder months in calendar order
+                month_order = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+                ordered_months = [m for m in month_order if m in monthly_pvt.columns]
+                monthly_pvt = monthly_pvt[ordered_months] if ordered_months else monthly_pvt
+
+                # Quarterly totals
+                qtr_pvt = sub.pivot_table(
+                    index=["Line", "Line Name"],
+                    columns="Quarter",
+                    values=metric_col,
+                    aggfunc="sum",
+                    fill_value=0,
+                )
+
+                # Combine: Quarter columns first, then Monthly
+                combined = pd.concat([qtr_pvt, monthly_pvt], axis=1)
+                combined["Total"] = combined.sum(axis=1)
+
+                # Daily and weekly averages from result
+                if "ProductionWeekDate" in result.columns:
+                    week_dates = pd.to_datetime(result["ProductionWeekDate"], errors="coerce")
+                    n_weeks = week_dates.dt.to_period("W").nunique()
+                    n_days  = week_dates.dt.date.nunique()
+                    if n_weeks > 0:
+                        weekly_avg = sub.groupby(["Line", "Line Name"])[metric_col].sum() / n_weeks
+                        daily_avg  = sub.groupby(["Line", "Line Name"])[metric_col].sum() / max(n_days, 1)
+                        combined["Weekly avg"] = weekly_avg
+                        combined["Daily avg"]  = daily_avg
+
+                # Format display
+                display = combined.copy()
+                for col in display.columns:
+                    display[col] = display[col].apply(fmt_fn)
+
+                st.dataframe(display, use_container_width=True)
+            except Exception as e:
+                st.error(f"Error building {label}: {e}")
+
+        _ma3_section("MA3 Pieces (Scheduled Qty)", "ScheduledQty", lambda v: f"{int(v):,}" if isinstance(v, (int, float)) else v)
+        st.divider()
+        _ma3_section("MA3 Hours (Total Hours)",    "Total Hours",  lambda v: f"{v:,.1f}" if isinstance(v, (int, float)) else v)
+        st.divider()
+        _ma3_section("MA3 Sales (Total Value $)",  "Total Value",  lambda v: f"${v:,.2f}" if isinstance(v, (int, float)) else v)
+
+        # MA3 Summary download
+        st.markdown("**Download MA3 Summary**")
+        buf_ma3 = io.BytesIO()
+        with pd.ExcelWriter(buf_ma3, engine="openpyxl") as w:
+            for sheet_key, metric_col in [
+                ("MA3_Pieces", "ScheduledQty"),
+                ("MA3_Hours",  "Total Hours"),
+                ("MA3_Sales",  "Total Value"),
+            ]:
+                if metric_col in result.columns:
+                    pvt = result.pivot_table(
+                        index=["Line", "Line Name"],
+                        columns="Month Name",
+                        values=metric_col,
+                        aggfunc="sum",
+                        fill_value=0,
+                    )
+                    pvt["Total"] = pvt.sum(axis=1)
+                    pvt.reset_index().to_excel(w, sheet_name=sheet_key, index=False)
+        st.download_button(
+            "⬇️ MA3 Summary Excel",
+            data=buf_ma3.getvalue(),
+            file_name="ma3_summary.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
 
 # ── M code viewer ─────────────────────────────────────────────────────────────
 with st.expander("📝 Current M code (Excel.xlsx)", expanded=False):

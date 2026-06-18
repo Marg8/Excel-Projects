@@ -21,6 +21,10 @@ DEFAULT_COL_LINE = "MRP"
 DEFAULT_COL_REQ_DATE = "Requested date"
 DEFAULT_COL_COMMIT_DATE = "Plan Request Date"
 DEFAULT_COL_STD_PACK = "Std Pack"
+DEFAULT_COL_PART = "Product code"    # join key
+DEFAULT_COL_HRS = "Std x Hr"        # in Hrs sheet
+DEFAULT_COL_COST = "Std Cost"       # in Cost sheet
+DEFAULT_COL_MATERIAL = "Material"   # key in master tables
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -88,6 +92,161 @@ def _round_up_to_std_pack(order_qty: float, std_pack: float) -> tuple[float, flo
     planned = float(math.ceil(q / sp) * sp)
     excess = max(0.0, planned - q)
     return planned, excess
+
+
+# ── Master table enrichment ──────────────────────────────────────────────────
+
+def build_hrs_lookup(
+    hrs_df: pd.DataFrame | None,
+    material_col: str = DEFAULT_COL_MATERIAL,
+    hrs_col: str = DEFAULT_COL_HRS,
+) -> dict[str, float]:
+    """
+    Returns {Material -> HrsPerUnit} by summing all routing operations per part.
+    Base quantity in SAP routing is per 1000 units; Std x Hr is already hr/unit.
+    """
+    if hrs_df is None or hrs_df.empty:
+        return {}
+    df = hrs_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    mat_col = _find_first_existing_col(df, [material_col, "Material"])
+    h_col   = _find_first_existing_col(df, [hrs_col, "Std x Hr", "Std_x_Hr", "StdxHr"])
+    if mat_col is None or h_col is None:
+        return {}
+    df["_mat"] = df[mat_col].astype(str).str.strip()
+    df["_hrs"] = df[h_col].apply(to_number)
+    df = df[df["_hrs"] > 0]
+    return df.groupby("_mat")["_hrs"].sum().to_dict()
+
+
+def build_cost_lookup(
+    cost_df: pd.DataFrame | None,
+    pn_col: str = "PN",
+    cost_col: str = DEFAULT_COL_COST,
+) -> dict[str, float]:
+    """Returns {PartNumber -> StdCost}."""
+    if cost_df is None or cost_df.empty:
+        return {}
+    df = cost_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    p_col = _find_first_existing_col(df, [pn_col, DEFAULT_COL_MATERIAL, "Material", "Part"])
+    c_col = _find_first_existing_col(df, [cost_col, "Std Cost", "StdCost", "Cost"])
+    if p_col is None or c_col is None:
+        return {}
+    df["_pn"]   = df[p_col].astype(str).str.strip()
+    df["_cost"] = df[c_col].apply(to_number)
+    return df.set_index("_pn")["_cost"].to_dict()
+
+
+def build_std_pack_lookup(
+    sp_df: pd.DataFrame | None,
+    material_col: str = DEFAULT_COL_MATERIAL,
+    pack_col: str = "Delivery unit",
+) -> dict[str, float]:
+    """Returns {Material -> DeliveryUnit (Std Pack)}."""
+    if sp_df is None or sp_df.empty:
+        return {}
+    df = sp_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    m_col = _find_first_existing_col(df, [material_col, "Material"])
+    p_col = _find_first_existing_col(df, [pack_col, "Delivery unit", "Min. MtO quantity", "Minimum delivery qty"])
+    if m_col is None or p_col is None:
+        return {}
+    df["_mat"]  = df[m_col].astype(str).str.strip()
+    df["_pack"] = df[p_col].apply(to_number)
+    return df.drop_duplicates(subset=["_mat"]).set_index("_mat")["_pack"].to_dict()
+
+
+def enrich_with_masters(
+    df: pd.DataFrame,
+    hrs_lookup: dict,
+    cost_lookup: dict,
+    sp_lookup: dict,
+    part_col: str = DEFAULT_COL_PART,
+    fallback_std_pack_col: str | None = DEFAULT_COL_STD_PACK,
+) -> pd.DataFrame:
+    """
+    Left-joins Hrs, Cost, and Std Pack master data onto the orders DataFrame.
+    Falls back to the existing Std Pack column in orders when the master is missing.
+    """
+    df = df.copy()
+    part_key = df[part_col].astype(str).str.strip() if part_col in df.columns else pd.Series([""]*len(df))
+
+    df["HrsPerUnit"] = part_key.map(hrs_lookup).fillna(0.0)
+    df["Std Cost"]   = part_key.map(cost_lookup).fillna(0.0)
+
+    # Std Pack: prefer master table; fall back to column in orders
+    sp_from_master = part_key.map(sp_lookup)
+    if fallback_std_pack_col and fallback_std_pack_col in df.columns:
+        sp_fallback = df[fallback_std_pack_col].apply(to_number)
+    else:
+        sp_fallback = pd.Series([0.0] * len(df), index=df.index)
+    df["Std Pack (Master)"] = sp_from_master.combine_first(sp_fallback).fillna(0.0)
+
+    df["Total Hours"] = df["QtyNum"] * df["HrsPerUnit"]
+    df["Total Value"] = df["QtyNum"] * df["Std Cost"]
+
+    return df
+
+
+def add_date_dimensions(df: pd.DataFrame, date_col: str = "PlanningDate") -> pd.DataFrame:
+    """Adds Year, Quarter, Month, MonthName, ISOWeek columns from a date column."""
+    df = df.copy()
+    dates = pd.to_datetime(df[date_col], errors="coerce")
+    df["Year"]      = dates.dt.year
+    df["Quarter"]   = "Q" + dates.dt.quarter.astype(str)
+    df["Month"]     = dates.dt.to_period("M").astype(str)
+    df["Month Name"] = dates.dt.strftime("%b")
+    df["ISOWeek"]   = dates.apply(lambda d: int(d.isocalendar()[1]) if pd.notna(d) else None)
+    return df
+
+
+def build_ma3_summary(
+    result: pd.DataFrame,
+    group_by: list[str] | None = None,
+) -> dict[str, pd.DataFrame]:
+    """
+    Returns three DataFrames (MA3 Pieces, MA3 Hours, MA3 Sales/Value)
+    pivoted by the requested dimension (default: Line Name × Month).
+    """
+    if result.empty:
+        empty = pd.DataFrame()
+        return {"Pieces": empty, "Hours": empty, "Value": empty}
+
+    group_by = group_by or ["Line Name", "Quarter", "Month Name"]
+    available = [c for c in group_by if c in result.columns]
+
+    def _pivot(metric_col: str) -> pd.DataFrame:
+        if metric_col not in result.columns:
+            return pd.DataFrame()
+        cols_needed = available + [metric_col]
+        sub = result[cols_needed].copy()
+        sub[metric_col] = pd.to_numeric(sub[metric_col], errors="coerce").fillna(0)
+        if len(available) < 2:
+            return sub.groupby(available)[metric_col].sum().reset_index()
+        row_key = available[0]
+        col_key = available[1:]
+        # For pivot we use the last grouping level as columns
+        pivot_col = col_key[-1]
+        extra_rows = [row_key] + col_key[:-1]
+        try:
+            pvt = sub.pivot_table(
+                index=extra_rows,
+                columns=pivot_col,
+                values=metric_col,
+                aggfunc="sum",
+                fill_value=0,
+            )
+            pvt["Total"] = pvt.sum(axis=1)
+            return pvt.reset_index()
+        except Exception:
+            return sub.groupby(extra_rows + [pivot_col])[metric_col].sum().reset_index()
+
+    return {
+        "Pieces": _pivot("ScheduledQty"),
+        "Hours":  _pivot("Total Hours"),
+        "Value":  _pivot("Total Value"),
+    }
 
 
 # ── Capacity parsing / simulation ────────────────────────────────────────────
@@ -395,6 +554,10 @@ def run_query(
     col_commit_date=DEFAULT_COL_COMMIT_DATE,
     col_std_pack=DEFAULT_COL_STD_PACK,
     capacity_line_col="Line",
+    hrs_df=None,
+    cost_df=None,
+    sp_df=None,
+    col_part=DEFAULT_COL_PART,
 ):
     df = data_df.copy()
     df.columns = [str(c).strip() for c in df.columns]
@@ -402,7 +565,23 @@ def run_query(
     df["QtyNum"] = df[col_qty].apply(to_number)
     df["Line"] = df[col_line].apply(normalize_line)
 
-    std_pack_col = _find_first_existing_col(df, [col_std_pack, "Std Pack", "StdPack", "STD PACK"])
+    # ── Enrich with master tables (Hrs, Cost, Std Pack) ──────────────────────
+    hrs_lookup = build_hrs_lookup(hrs_df)
+    cost_lookup = build_cost_lookup(cost_df)
+    sp_lookup = build_std_pack_lookup(sp_df)
+    df = enrich_with_masters(
+        df,
+        hrs_lookup=hrs_lookup,
+        cost_lookup=cost_lookup,
+        sp_lookup=sp_lookup,
+        part_col=col_part if col_part in df.columns else DEFAULT_COL_PART,
+        fallback_std_pack_col=col_std_pack,
+    )
+
+    # Std Pack source: prefer master lookup result, fall back to orders column
+    std_pack_col = _find_first_existing_col(
+        df, ["Std Pack (Master)", col_std_pack, "Std Pack", "StdPack", "STD PACK"]
+    )
     if std_pack_col is None:
         df["StdPackNum"] = 0.0
     else:
@@ -440,16 +619,28 @@ def run_query(
 
     result["ScheduledQty"] = result["ScheduledQtyBase"].apply(lambda q: int(math.floor(q)) if q else 0)
 
-    cols = list(result.columns)
-    if "Excess Std Pack" in cols and "ScheduledQty" in cols:
-        cols.remove("Excess Std Pack")
-        idx_sched = cols.index("ScheduledQty") + 1
-        cols.insert(idx_sched, "Excess Std Pack")
+    # ── Compute per-slice metrics (proportional to scheduled qty) ────────────
+    hrs_per_unit = result.get("HrsPerUnit", pd.Series([0.0] * len(result), index=result.index)).fillna(0.0)
+    std_cost     = result.get("Std Cost",   pd.Series([0.0] * len(result), index=result.index)).fillna(0.0)
+    result["Total Hours"] = result["ScheduledQty"] * hrs_per_unit
+    result["Total Value"] = result["ScheduledQty"] * std_cost
 
-    if "Line Name" in cols and "Line" in cols:
-        cols.remove("Line Name")
-        idx_line = cols.index("Line") + 1
-        cols.insert(idx_line, "Line Name")
+    # ── Date dimensions ───────────────────────────────────────────────────────
+    if "ProductionWeekDate" in result.columns:
+        result = add_date_dimensions(result, date_col="ProductionWeekDate")
+
+    # ── Column ordering ───────────────────────────────────────────────────────
+    cols = list(result.columns)
+
+    def _move_after(lst, item, after):
+        if item in lst and after in lst:
+            lst.remove(item)
+            lst.insert(lst.index(after) + 1, item)
+
+    _move_after(cols, "Excess Std Pack", "ScheduledQty")
+    _move_after(cols, "Line Name",       "Line")
+    _move_after(cols, "Total Hours",     "ScheduledQty")
+    _move_after(cols, "Total Value",     "Total Hours")
 
     result = result[cols]
     return result
