@@ -12,10 +12,13 @@ import streamlit as st
 from pq_logic import (
     DEFAULT_CAPS,
     DEFAULT_COL_QTY,
-    DEFAULT_COL_MRP,
+    DEFAULT_COL_LINE,
     DEFAULT_COL_REQ_DATE,
     DEFAULT_COL_COMMIT_DATE,
+    DEFAULT_COL_STD_PACK,
+    apply_capacity_overrides,
     build_cap_flat,
+    capacity_comparison,
     run_query,
 )
 
@@ -44,10 +47,12 @@ with st.sidebar:
 
     st.subheader("Column names")
     col_qty         = st.text_input("Qty column",            value=DEFAULT_COL_QTY)
-    col_mrp         = st.text_input("MRP column",            value=DEFAULT_COL_MRP)
+    col_line        = st.text_input("Line column",           value=DEFAULT_COL_LINE,
+                                    help="Primary planning key. Example: HC7, H2J, HC4_A9R")
     col_req_date    = st.text_input("Requested date column", value=DEFAULT_COL_REQ_DATE)
     col_commit_date = st.text_input("Plan/Commit date column", value=DEFAULT_COL_COMMIT_DATE,
                                     help="Used first; falls back to Req. date if empty.")
+    col_std_pack    = st.text_input("Std Pack column",       value=DEFAULT_COL_STD_PACK)
 
     st.subheader("Default capacities (fallback)")
     for lg in list(DEFAULT_CAPS):
@@ -135,19 +140,76 @@ if cap_df is not None:
     with st.expander(f"📋 Preview — {cap_sheet}  ({len(cap_df):,} rows)", expanded=False):
         st.dataframe(cap_df, use_container_width=True)
 
+    base_cap_flat = build_cap_flat(cap_df)
+
     with st.expander("🔍 Parsed capacity buckets", expanded=False):
-        cap_flat = build_cap_flat(cap_df)
-        if cap_flat:
-            cdf = pd.DataFrame(cap_flat)
+        if base_cap_flat:
+            cdf = pd.DataFrame(base_cap_flat)
             st.dataframe(
-                cdf.pivot(index="_LG", columns="_WkNum", values="_Cap").fillna(0),
+                cdf.pivot(index="_Line", columns="_WeekDate", values="_Cap").fillna(0),
                 use_container_width=True,
             )
         else:
-            st.warning("No capacity rows parsed. Check that 'Line Group' column and date headers exist.")
+            st.warning("No capacity rows parsed. Check that 'Line' column and date headers exist.")
+
+    st.subheader("3 · Scenario simulation (Line + Week override)")
+    sim_help = "Change only selected weeks. Other weeks stay as original capacity."
+    st.caption(sim_help)
+
+    if base_cap_flat:
+        cdf = pd.DataFrame(base_cap_flat)
+        line_options = sorted(cdf["_Line"].dropna().unique().tolist())
+        week_options = sorted(cdf["_WeekDate"].dropna().unique().tolist())
+    else:
+        line_options = []
+        week_options = []
+
+    sim_seed = pd.DataFrame(
+        {
+            "Line": [line_options[0]] if line_options else [""],
+            "Week": [week_options[0]] if week_options else [pd.NaT],
+            "New Capacity": [0],
+        }
+    )
+
+    sim_df = st.data_editor(
+        sim_seed,
+        key="scenario_overrides",
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "Line": st.column_config.SelectboxColumn("Line", options=line_options, required=False),
+            "Week": st.column_config.DateColumn("Week", format="YYYY-MM-DD", required=False),
+            "New Capacity": st.column_config.NumberColumn("New Capacity", min_value=0, step=100),
+        },
+    )
+
+    sim_df = sim_df.dropna(subset=["Line", "Week"]) if not sim_df.empty else sim_df
+    sim_df = sim_df[sim_df["New Capacity"].fillna(0) > 0] if not sim_df.empty else sim_df
+
+    adjusted_cap_flat = apply_capacity_overrides(base_cap_flat, sim_df)
+    cmp_df = capacity_comparison(base_cap_flat, adjusted_cap_flat)
+
+    with st.expander("📊 Capacity comparison (Original vs Adjusted vs Delta)", expanded=False):
+        changed = cmp_df[cmp_df["Delta"] != 0].copy()
+        st.dataframe(changed if not changed.empty else cmp_df.head(0), use_container_width=True)
+
+        cmp_pivot = cmp_df.pivot_table(
+            index="Line",
+            columns="Week",
+            values="Adjusted capacity",
+            aggfunc="sum",
+            fill_value=0,
+        )
+        st.caption("Adjusted capacity table")
+        st.dataframe(cmp_pivot, use_container_width=True)
+else:
+    base_cap_flat = []
+    sim_df = pd.DataFrame(columns=["Line", "Week", "New Capacity"])
+    cmp_df = pd.DataFrame(columns=["Line", "Week", "Original capacity", "Adjusted capacity", "Delta"])
 
 # ── Run ───────────────────────────────────────────────────────────────────────
-st.subheader("3 · Run")
+st.subheader("4 · Run")
 
 if st.button("▶ Run Query", type="primary", use_container_width=True):
     with st.spinner("Running scheduling logic…"):
@@ -155,11 +217,13 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
             result = run_query(
                 data_df,
                 cap_df,
+                capacity_overrides_df=sim_df,
                 base_week=int(base_week),
                 col_qty=col_qty,
-                col_mrp=col_mrp,
+                col_line=col_line,
                 col_req_date=col_req_date,
                 col_commit_date=col_commit_date,
+                col_std_pack=col_std_pack,
             )
         except Exception as e:
             st.error(f"Error: {e}")
@@ -168,16 +232,17 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
 
     # ── Metrics ───────────────────────────────────────────────────────────────
     st.success(f"✅ Done — {len(result):,} rows")
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Output rows",      f"{len(result):,}")
     m2.metric("Split orders",     f"{(result['SplitFlag']=='SPLIT').sum():,}")
-    m3.metric("Groups",           result['LineGroup'].nunique())
+    m3.metric("Lines",            result['Line'].nunique())
     m4.metric("Total Sched. Qty", f"{result['ScheduledQty'].sum():,.0f}")
+    m5.metric("Total Excess Std Pack", f"{result['Excess Std Pack'].sum():,.0f}")
 
     # ── Summary pivot ─────────────────────────────────────────────────────────
-    with st.expander("📊 Summary — LineGroup × Production Week", expanded=True):
+    with st.expander("📊 Summary — Line × Production Week", expanded=True):
         summ = (
-            result.groupby(["LineGroup", "ProductionWeek"], sort=True)
+            result.groupby(["Line", "ProductionWeek"], sort=True)
             .agg(
                 Orders          = ("ScheduledQty", "count"),
                 ScheduledQty    = ("ScheduledQty", "sum"),
@@ -187,7 +252,7 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
         )
         # Pivot for compact view
         pivot = summ.pivot_table(
-            index="LineGroup", columns="ProductionWeek",
+            index="Line", columns="ProductionWeek",
             values="ScheduledQty", aggfunc="sum", fill_value=0,
         )
         st.dataframe(pivot, use_container_width=True)
