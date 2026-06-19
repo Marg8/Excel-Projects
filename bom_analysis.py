@@ -108,7 +108,10 @@ def parse_bom(
       Material, Component, Component_Desc, BOM_Usage, BOM_Level, Alt_BOM, MRP
 
     BOM_Usage = qty of Component per 1 unit of Material.
-    Filters to primary BOM (Alt_BOM == alt_bom) and the requested BOM level.
+        Selects one Alt BOM version per Material:
+            - use `alt_bom` when that version exists for the Material,
+            - otherwise fallback to the next available version for that Material.
+        Then filters to the requested BOM level.
     """
     if bom_df is None or bom_df.empty:
         return pd.DataFrame()
@@ -167,8 +170,14 @@ def parse_bom(
         & out["Component"].notna() & (out["Component"] != "nan") & (out["Component"] != "")
         & (out["BOM_Usage"] > 0)
     ]
-    out = out[out["Alt_BOM"] == alt_bom]
     out = out[out["BOM_Level"] == bom_level]
+
+    # Keep exactly one BOM version per Material.
+    # Priority: requested alt_bom (default 1). If missing, use the smallest available Alt_BOM.
+    chosen_alt = out.groupby("Material")["Alt_BOM"].transform(
+        lambda s: alt_bom if (s == alt_bom).any() else s.min()
+    )
+    out = out[out["Alt_BOM"] == chosen_alt]
 
     return out.reset_index(drop=True)
 
@@ -262,33 +271,158 @@ def component_demand_pivot(
 
 # ── 5. Build capability computation ──────────────────────────────────────────
 
+def _build_stock_lookup(stock_df: pd.DataFrame | None) -> dict[str, float]:
+    if stock_df is None or stock_df.empty:
+        return {}
+
+    df = stock_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    comp_col = _col(df, ["Component", "Material", "PN", "Part Number", "Part"])
+    qty_col = _col(df, ["Stock", "Stock Qty", "Stock_Qty", "Qty", "Quantity", "On Hand"])
+    if comp_col is None or qty_col is None:
+        return {}
+
+    df["_comp"] = df[comp_col].astype(str).str.strip()
+    df["_qty"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0.0)
+    df = df[df["_comp"] != ""]
+    return df.groupby("_comp")["_qty"].sum().to_dict()
+
+
+def _build_weekly_po_table(
+    rm_po_df: pd.DataFrame | None,
+) -> pd.DataFrame:
+    if rm_po_df is None or rm_po_df.empty:
+        return pd.DataFrame(columns=["Component", "PO_WeekDate", "PO_Qty"])
+
+    df = rm_po_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    comp_col = _col(df, ["Component", "Material", "PN", "Part Number", "Part"])
+    qty_col = _col(df, ["PO Qty", "Qty", "Quantity", "Open Qty", "Order Qty"])
+    date_col = _col(df, ["PO Date", "Due Date", "Delivery Date", "Date", "Week Date", "Requested date"])
+
+    if comp_col is None or qty_col is None or date_col is None:
+        return pd.DataFrame(columns=["Component", "PO_WeekDate", "PO_Qty"])
+
+    out = pd.DataFrame()
+    out["Component"] = df[comp_col].astype(str).str.strip()
+    out["PO_Qty"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0.0)
+    out["PO_WeekDate"] = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
+
+    out = out[
+        out["Component"].notna()
+        & (out["Component"] != "")
+        & out["PO_WeekDate"].notna()
+        & (out["PO_Qty"] > 0)
+    ]
+    if out.empty:
+        return pd.DataFrame(columns=["Component", "PO_WeekDate", "PO_Qty"])
+
+    return out.groupby(["Component", "PO_WeekDate"], as_index=False)["PO_Qty"].sum()
+
+
+def _cum_po_by_component_week(
+    po_weekly: pd.DataFrame,
+    components: pd.Series,
+    week_dates: pd.Series,
+) -> pd.Series:
+    if po_weekly.empty:
+        return pd.Series([0.0] * len(components), index=components.index, dtype="float64")
+
+    po_map: dict[str, list[tuple[pd.Timestamp, float]]] = {}
+    for _, r in po_weekly.iterrows():
+        comp = str(r["Component"]).strip()
+        dt = pd.to_datetime(r["PO_WeekDate"], errors="coerce")
+        qty = float(pd.to_numeric(r["PO_Qty"], errors="coerce") or 0.0)
+        if not comp or pd.isna(dt) or qty <= 0:
+            continue
+        po_map.setdefault(comp, []).append((dt.normalize(), qty))
+
+    for comp in po_map:
+        po_map[comp].sort(key=lambda t: t[0])
+
+    values: list[float] = []
+    for comp, wk in zip(components.astype(str), week_dates):
+        wk_dt = pd.to_datetime(wk, errors="coerce")
+        if pd.isna(wk_dt):
+            values.append(0.0)
+            continue
+        wk_dt = wk_dt.normalize()
+        cum = 0.0
+        for po_dt, po_qty in po_map.get(comp.strip(), []):
+            if po_dt <= wk_dt:
+                cum += po_qty
+            else:
+                break
+        values.append(cum)
+    return pd.Series(values, index=components.index, dtype="float64")
+
 def compute_build_capability(
     exploded_df: pd.DataFrame,
-    stock_lookup: dict[str, float],
+    stock_lookup: dict[str, float] | None = None,
+    stock_df: pd.DataFrame | None = None,
+    rm_po_df: pd.DataFrame | None = None,
+    week_col: str = "ProductionWeek",
+    week_date_col: str = "ProductionWeekDate",
 ) -> pd.DataFrame:
     """
-    Enriches exploded demand with stock-based metrics:
-      Available_Qty   – from stock_lookup (0 if unknown)
-      Coverage_Pct    – min(100, available / demand * 100)
-      Shortage        – max(0, demand - available)
-      Buildable_From_Comp – available / BOM_Usage  (FG units this component supports)
+    Enrich exploded demand with CTB/supply metrics.
+
+    Supports two modes:
+      1) Legacy: pass stock_lookup dict.
+      2) Weekly CTB: pass stock_df and/or rm_po_df (used by app.py).
     """
     df = exploded_df.copy()
-    df["Available_Qty"] = df["Component"].map(stock_lookup).fillna(0.0)
+
+    if "Component" not in df.columns:
+        return df
+
+    # Build stock lookup from df input when provided; merge with explicit lookup.
+    merged_lookup: dict[str, float] = {}
+    if stock_lookup:
+        merged_lookup.update({str(k).strip(): float(v) for k, v in stock_lookup.items()})
+    if stock_df is not None and not stock_df.empty:
+        for comp, qty in _build_stock_lookup(stock_df).items():
+            merged_lookup[comp] = merged_lookup.get(comp, 0.0) + float(qty)
+
+    df["Stock_Qty"] = df["Component"].map(merged_lookup).fillna(0.0)
+
+    if rm_po_df is not None and not rm_po_df.empty and week_date_col in df.columns:
+        po_weekly = _build_weekly_po_table(rm_po_df)
+        df["Cum_PO_Qty"] = _cum_po_by_component_week(
+            po_weekly,
+            components=df["Component"],
+            week_dates=df[week_date_col],
+        )
+    else:
+        df["Cum_PO_Qty"] = 0.0
+
+    df["Available_Supply"] = df["Stock_Qty"] + df["Cum_PO_Qty"]
+
+    # Keep legacy column name used by older pipeline.
+    df["Available_Qty"] = df["Available_Supply"]
 
     def _coverage(row):
         if row["Comp_Demand"] <= 0:
             return 100.0
-        return min(100.0, row["Available_Qty"] / row["Comp_Demand"] * 100.0)
+        return min(100.0, row["Available_Supply"] / row["Comp_Demand"] * 100.0)
 
     def _buildable(row):
         if row["BOM_Usage"] <= 0:
             return row["FG_Qty"]
-        return row["Available_Qty"] / row["BOM_Usage"]
+        return row["Available_Supply"] / row["BOM_Usage"]
 
     df["Coverage_Pct"]        = df.apply(_coverage, axis=1)
     df["Buildable_From_Comp"] = df.apply(_buildable, axis=1)
-    df["Shortage"]            = (df["Comp_Demand"] - df["Available_Qty"]).clip(lower=0)
+    df["Shortage"]            = (df["Comp_Demand"] - df["Available_Supply"]).clip(lower=0)
+    # Hard CTB rule: if no stock and no PO by that week, CTB is false.
+    df["CTB_Flag"] = df["Available_Supply"] > 0
+
+    # Keep week_col referenced by callers for consistency.
+    if week_col not in df.columns and week_date_col in df.columns:
+        df[week_col] = pd.to_datetime(df[week_date_col], errors="coerce").dt.strftime("%Y-%m-%d")
+
     return df
 
 
@@ -431,3 +565,274 @@ def run_build_analysis(
     )
 
     return bom_clean, exploded, capability, cost_dated_lookup
+
+
+# ── 8. Raw Material Coverage report ──────────────────────────────────────────
+
+def build_rm_coverage_table(
+    exploded_df: pd.DataFrame,
+    stock_df: pd.DataFrame | None = None,
+    rm_po_df: pd.DataFrame | None = None,
+    week_col: str = "ProductionWeek",
+    week_date_col: str = "ProductionWeekDate",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Build the Raw Material Coverage report.
+
+    Returns:
+      coverage_df – one row per component × metric (Demand / Receipts / Ending Balance)
+                    Columns: Component, Component_Desc, UOM, Initial_Inventory,
+                             Metric, <week1>, <week2>, ...
+      kpi_df      – per-component KPIs:
+                    Component, Description, Initial_Inventory,
+                    First_Shortage_Week, Pct_Weeks_Covered, Total_Shortage_Qty
+
+    Ending Balance formula:
+      EB[week0] = Initial_Inventory + Receipts[week0] - Demand[week0]
+      EB[weekN] = EB[weekN-1] + Receipts[weekN] - Demand[weekN]
+    """
+    if exploded_df is None or exploded_df.empty or week_col not in exploded_df.columns:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # ── 1. Ordered week list ───────────────────────────────────────────────────
+    if week_date_col in exploded_df.columns:
+        week_map = (
+            exploded_df[[week_col, week_date_col]]
+            .dropna(subset=[week_col])
+            .drop_duplicates()
+            .sort_values(week_date_col)
+        )
+        weeks = list(week_map[week_col])
+        week_dates_lookup: dict = dict(zip(week_map[week_col], week_map[week_date_col]))
+    else:
+        weeks = sorted(exploded_df[week_col].dropna().unique().tolist())
+        week_dates_lookup = {}
+
+    if not weeks:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # ── 2. Demand pivot: Component × week ─────────────────────────────────────
+    demand_pvt = exploded_df.pivot_table(
+        index=["Component", "Component_Desc"],
+        columns=week_col,
+        values="Comp_Demand",
+        aggfunc="sum",
+        fill_value=0,
+    ).reset_index()
+
+    # ── 3. Initial inventory ───────────────────────────────────────────────────
+    stock_lookup = _build_stock_lookup(stock_df) if stock_df is not None else {}
+
+    # UOM from stock_df if available
+    uom_lookup: dict[str, str] = {}
+    if stock_df is not None and not stock_df.empty:
+        sdf = stock_df.copy()
+        sdf.columns = [str(c).strip() for c in sdf.columns]
+        comp_col_s = _col(sdf, ["Component", "Material", "PN", "Part Number", "Part"])
+        uom_col_s = _col(sdf, ["UOM", "Unit of Measure", "Unit", "Base UOM", "Base Unit"])
+        if comp_col_s and uom_col_s:
+            for _, r in sdf.iterrows():
+                c = str(r[comp_col_s]).strip()
+                u = str(r[uom_col_s]).strip() if pd.notna(r.get(uom_col_s, "")) else ""
+                if c:
+                    uom_lookup[c] = u
+
+    # ── 4. Weekly receipts from RM_PO ─────────────────────────────────────────
+    # Map each PO to the first production week whose date >= PO date.
+    receipts_map: dict[tuple, float] = {}
+    if rm_po_df is not None and not rm_po_df.empty and week_dates_lookup:
+        po_weekly = _build_weekly_po_table(rm_po_df)
+        if not po_weekly.empty:
+            sorted_weeks = sorted(week_dates_lookup.keys(),
+                                  key=lambda w: pd.to_datetime(week_dates_lookup[w], errors="coerce"))
+            sorted_wdts = [pd.to_datetime(week_dates_lookup[w], errors="coerce").normalize()
+                           for w in sorted_weeks]
+
+            for _, po_row in po_weekly.iterrows():
+                comp = str(po_row["Component"]).strip()
+                po_dt = pd.to_datetime(po_row["PO_WeekDate"], errors="coerce")
+                if pd.isna(po_dt):
+                    continue
+                po_dt = po_dt.normalize()
+                matched_wk = None
+                for wk, wk_dt in zip(sorted_weeks, sorted_wdts):
+                    if pd.notna(wk_dt) and wk_dt >= po_dt:
+                        matched_wk = wk
+                        break
+                if matched_wk is None:
+                    matched_wk = sorted_weeks[-1]
+                key = (comp, matched_wk)
+                receipts_map[key] = receipts_map.get(key, 0.0) + float(po_row["PO_Qty"])
+
+    # ── 5. Build 3-row-per-component coverage table ───────────────────────────
+    coverage_rows: list[dict] = []
+    kpi_rows: list[dict] = []
+
+    for _, comp_row in demand_pvt.iterrows():
+        comp = str(comp_row["Component"]).strip()
+        raw_desc = comp_row.get("Component_Desc", comp)
+        desc = "" if str(raw_desc) in ("nan", "None", "", comp) else str(raw_desc).strip()
+        initial_inv = stock_lookup.get(comp, 0.0)
+        uom = uom_lookup.get(comp, "")
+
+        row_d: dict = {"Component": comp, "Component_Desc": desc,
+                       "UOM": uom, "Initial_Inventory": initial_inv, "Metric": "Demand"}
+        row_r: dict = {"Component": "", "Component_Desc": "", "UOM": "",
+                       "Initial_Inventory": None, "Metric": "Receipts"}
+        row_b: dict = {"Component": "", "Component_Desc": "", "UOM": "",
+                       "Initial_Inventory": None, "Metric": "Ending Balance"}
+
+        balance = initial_inv
+        first_shortage_wk = None
+        shortage_count = 0
+        total_shortage_qty = 0.0
+
+        for wk in weeks:
+            demand_val = float(comp_row.get(wk, 0) or 0)
+            receipts_val = receipts_map.get((comp, wk), 0.0)
+            balance = balance + receipts_val - demand_val
+
+            row_d[wk] = demand_val
+            row_r[wk] = receipts_val
+            row_b[wk] = round(balance, 2)
+
+            if balance < 0:
+                if first_shortage_wk is None:
+                    first_shortage_wk = wk
+                shortage_count += 1
+                total_shortage_qty += abs(balance)
+
+        coverage_rows.extend([row_d, row_r, row_b])
+
+        pct_covered = round((len(weeks) - shortage_count) / len(weeks) * 100, 1) if weeks else 100.0
+        kpi_rows.append({
+            "Component":          comp,
+            "Description":        desc,
+            "Initial_Inventory":  initial_inv,
+            "First_Shortage_Week": first_shortage_wk if first_shortage_wk is not None else "—",
+            "Pct_Weeks_Covered":  pct_covered,
+            "Total_Shortage_Qty": round(total_shortage_qty, 0),
+        })
+
+    coverage_df = pd.DataFrame(coverage_rows)
+    kpi_df = pd.DataFrame(kpi_rows)
+    return coverage_df, kpi_df
+
+
+def rm_coverage_to_excel(
+    coverage_df: pd.DataFrame,
+    kpi_df: pd.DataFrame,
+) -> bytes:
+    """
+    Returns a formatted xlsx file with two sheets:
+      - 'RM Coverage'  : green header, red/green Ending Balance cells
+      - 'KPI Summary'  : per-component KPI table
+    """
+    import io as _io
+    from openpyxl import Workbook
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    buf = _io.BytesIO()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "RM Coverage"
+
+    HDR_FILL   = PatternFill("solid", fgColor="1B5E20")
+    HDR_FONT   = Font(bold=True, color="FFFFFF")
+    RED_FILL   = PatternFill("solid", fgColor="FFCDD2")
+    RED_FONT   = Font(bold=True, color="B71C1C")
+    GRN_FILL   = PatternFill("solid", fgColor="C8E6C9")
+    GRN_FONT   = Font(color="1B5E20")
+    ZERO_FILL  = PatternFill("solid", fgColor="F5F5F5")
+    RCP_FILL   = PatternFill("solid", fgColor="E8F5E9")
+    GRP_FILL   = PatternFill("solid", fgColor="DDEEFF")
+    GRP_BORDER = Border(bottom=Side(style="medium", color="9E9E9E"))
+    NUM_FMT    = "#,##0"
+    RIGHT      = Alignment(horizontal="right")
+    LEFT       = Alignment(horizontal="left")
+    CENTER     = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    if coverage_df.empty:
+        wb.save(buf)
+        return buf.getvalue()
+
+    info_cols = ["Component", "Component_Desc", "UOM", "Initial_Inventory", "Metric"]
+    week_keys = [c for c in coverage_df.columns if c not in info_cols]
+
+    headers = (
+        ["Part Number", "Description", "UOM", "Initial Inventory", "Metric"]
+        + [f"Wk {c}" if isinstance(c, int) else str(c) for c in week_keys]
+    )
+    ws.append(headers)
+    for ci in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=ci)
+        cell.fill = HDR_FILL
+        cell.font = HDR_FONT
+        cell.alignment = CENTER
+    ws.freeze_panes = "F2"
+
+    for _, row in coverage_df.iterrows():
+        values = [row.get(c, "") for c in info_cols + week_keys]
+        ws.append(values)
+        ri = ws.max_row
+        metric = str(row.get("Metric", ""))
+
+        # Info columns: light blue on Part Number row
+        is_pn_row = bool(str(row.get("Component", "")).strip())
+        for ci, col_key in enumerate(info_cols + week_keys, 1):
+            cell = ws.cell(row=ri, column=ci)
+            cell.alignment = RIGHT if ci > 4 else LEFT
+            if is_pn_row and ci <= 5:
+                cell.fill = GRP_FILL
+
+            if col_key in week_keys:
+                raw = row.get(col_key, "")
+                try:
+                    num = float(raw)
+                except (ValueError, TypeError):
+                    num = None
+
+                if metric == "Ending Balance" and num is not None:
+                    cell.number_format = NUM_FMT
+                    if num < 0:
+                        cell.fill = RED_FILL
+                        cell.font = RED_FONT
+                    elif num > 0:
+                        cell.fill = GRN_FILL
+                        cell.font = GRN_FONT
+                    else:
+                        cell.fill = ZERO_FILL
+                elif metric == "Receipts":
+                    cell.fill = RCP_FILL
+                    cell.number_format = NUM_FMT
+                elif metric == "Demand":
+                    cell.number_format = NUM_FMT
+
+        if metric == "Ending Balance":
+            for ci in range(1, len(headers) + 1):
+                ws.cell(row=ri, column=ci).border = GRP_BORDER
+
+    # Column widths
+    ws.column_dimensions["A"].width = 16
+    ws.column_dimensions["B"].width = 24
+    ws.column_dimensions["C"].width = 8
+    ws.column_dimensions["D"].width = 14
+    ws.column_dimensions["E"].width = 16
+    for i in range(1, len(week_keys) + 1):
+        ws.column_dimensions[get_column_letter(5 + i)].width = 11
+
+    # KPI sheet
+    if not kpi_df.empty:
+        ws2 = wb.create_sheet("KPI Summary")
+        ws2.append(list(kpi_df.columns))
+        for ci in range(1, len(kpi_df.columns) + 1):
+            cell = ws2.cell(row=1, column=ci)
+            cell.fill = HDR_FILL
+            cell.font = HDR_FONT
+            cell.alignment = CENTER
+        for _, row in kpi_df.iterrows():
+            ws2.append(list(row.values))
+
+    wb.save(buf)
+    return buf.getvalue()

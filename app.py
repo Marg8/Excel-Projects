@@ -36,6 +36,8 @@ from bom_analysis import (
     build_capability_summary,
     shortage_report,
     run_build_analysis,
+    build_rm_coverage_table,
+    rm_coverage_to_excel,
 )
 
 WORKSPACE_FILE  = "MPS.xlsx"
@@ -645,11 +647,12 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
                 exploded_supply = exploded_base.copy()
 
             # ── Tabs ──────────────────────────────────────────────────────────
-            tab_demand, tab_stock, tab_capability, tab_cost = st.tabs([
+            tab_demand, tab_stock, tab_capability, tab_cost, tab_coverage = st.tabs([
                 "📦 Component Demand",
                 "🏷️ Stock Input & Shortage",
                 "🏗️ Build Capability (FG Output)",
                 "💰 Cost Traceability",
+                "📋 RM Coverage Report",
             ])
 
             # ── Tab 1: Component demand pivot ─────────────────────────────────
@@ -908,6 +911,143 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
                         )
                 else:
                     st.info("No Cost sheet loaded — select the Cost sheet in Section 2.")
+
+            # ── Tab 5: RM Coverage Report ──────────────────────────────────────
+            with tab_coverage:
+                st.markdown(
+                    "**Raw Material Coverage** — weekly MRP simulation per component: "
+                    "`Ending Balance = Prior Balance + Receipts − Demand`"
+                )
+
+                cov_df, cov_kpi = build_rm_coverage_table(
+                    exploded_base,
+                    stock_df=stock_df,
+                    rm_po_df=rm_po_df,
+                )
+
+                if cov_df.empty:
+                    st.info(
+                        "No coverage data. Ensure BOM explosion matched components "
+                        "and Stock/RM_PO sheets are loaded."
+                    )
+                else:
+                    info_cols_cov = ["Component", "Component_Desc", "UOM",
+                                     "Initial_Inventory", "Metric"]
+                    week_keys_cov = [c for c in cov_df.columns if c not in info_cols_cov]
+
+                    # ── Top KPIs ──────────────────────────────────────────────
+                    at_risk    = int((cov_kpi["Pct_Weeks_Covered"] < 100).sum())
+                    total_short = cov_kpi["Total_Shortage_Qty"].sum()
+                    shortage_rows = cov_kpi[cov_kpi["First_Shortage_Week"] != "—"]
+                    first_short = (
+                        str(shortage_rows["First_Shortage_Week"].min())
+                        if not shortage_rows.empty else "—"
+                    )
+
+                    ka, kb, kc = st.columns(3)
+                    ka.metric("Materials at Risk",
+                              f"{at_risk} / {len(cov_kpi)}",
+                              delta=None if at_risk == 0 else f"{at_risk} shortage",
+                              delta_color="inverse")
+                    kb.metric("Total Shortage Qty",   f"{total_short:,.0f}")
+                    kc.metric("First Shortage Week",  first_short)
+
+                    # ── Styled coverage table ─────────────────────────────────
+                    display_cov = cov_df.copy()
+                    renamed_weeks = [
+                        f"Wk {c}" if isinstance(c, int) else str(c)
+                        for c in week_keys_cov
+                    ]
+                    display_cov.columns = (
+                        ["Part Number", "Description", "UOM",
+                         "Initial Inventory", "Metric"]
+                        + renamed_weeks
+                    )
+                    num_cols_cov = renamed_weeks + ["Initial Inventory"]
+
+                    def _style_cov(df: pd.DataFrame) -> pd.DataFrame:
+                        styles = pd.DataFrame("", index=df.index, columns=df.columns)
+                        for idx in df.index:
+                            metric = df.at[idx, "Metric"]
+                            for wk in renamed_weeks:
+                                if wk not in df.columns:
+                                    continue
+                                raw = df.at[idx, wk]
+                                if metric == "Ending Balance":
+                                    try:
+                                        v = float(raw)
+                                    except (ValueError, TypeError):
+                                        continue
+                                    if v < 0:
+                                        styles.at[idx, wk] = (
+                                            "background-color:#FFCDD2;"
+                                            "color:#B71C1C;font-weight:bold"
+                                        )
+                                    elif v > 0:
+                                        styles.at[idx, wk] = (
+                                            "background-color:#C8E6C9;color:#1B5E20"
+                                        )
+                                    else:
+                                        styles.at[idx, wk] = (
+                                            "background-color:#F5F5F5;color:#757575"
+                                        )
+                                elif metric == "Receipts":
+                                    styles.at[idx, wk] = "background-color:#E8F5E9"
+                        return styles
+
+                    fmt_cov = {c: "{:,.0f}" for c in num_cols_cov}
+                    styled_cov = (
+                        display_cov.style
+                        .apply(_style_cov, axis=None)
+                        .set_table_styles([{
+                            "selector": "thead th",
+                            "props": [
+                                ("background-color", "#1B5E20"),
+                                ("color", "white"),
+                                ("font-weight", "bold"),
+                            ],
+                        }])
+                        .format(fmt_cov, na_rep="")
+                    )
+                    st.dataframe(
+                        styled_cov,
+                        use_container_width=True,
+                        height=min(700, len(cov_df) * 35 + 55),
+                    )
+
+                    # ── KPI summary table ─────────────────────────────────────
+                    with st.expander("📊 Per-Material KPI Summary", expanded=True):
+                        kpi_fmt = {
+                            "Initial_Inventory":  "{:,.0f}",
+                            "Pct_Weeks_Covered":  "{:.1f}%",
+                            "Total_Shortage_Qty": "{:,.0f}",
+                        }
+                        styled_kpi = (
+                            cov_kpi.style
+                            .format(kpi_fmt)
+                            .background_gradient(
+                                subset=["Pct_Weeks_Covered"],
+                                cmap="RdYlGn", vmin=0, vmax=100,
+                            )
+                            .background_gradient(
+                                subset=["Total_Shortage_Qty"],
+                                cmap="Reds",
+                            )
+                        )
+                        st.dataframe(styled_kpi, use_container_width=True)
+
+                    # ── Excel download ────────────────────────────────────────
+                    cov_excel = rm_coverage_to_excel(cov_df, cov_kpi)
+                    st.download_button(
+                        "⬇️ RM Coverage Excel (Formatted)",
+                        data=cov_excel,
+                        file_name="rm_coverage_report.xlsx",
+                        mime=(
+                            "application/vnd.openxmlformats-"
+                            "officedocument.spreadsheetml.sheet"
+                        ),
+                        use_container_width=True,
+                    )
 
 # ── M code viewer ─────────────────────────────────────────────────────────────
 with st.expander("📝 Current M code (Excel.xlsx)", expanded=False):
