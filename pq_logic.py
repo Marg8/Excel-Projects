@@ -94,6 +94,109 @@ def _round_up_to_std_pack(order_qty: float, std_pack: float) -> tuple[float, flo
     return planned, excess
 
 
+def data_quality_report(
+    data_df: pd.DataFrame,
+    capacity_df: pd.DataFrame | None = None,
+    sp_df: pd.DataFrame | None = None,
+    col_qty: str = DEFAULT_COL_QTY,
+    col_line: str = DEFAULT_COL_LINE,
+    col_std_pack: str = DEFAULT_COL_STD_PACK,
+    col_part: str = DEFAULT_COL_PART,
+    capacity_line_col: str = "Line",
+) -> dict:
+    """
+    Validate key data assumptions and return warnings for the UI.
+    """
+    issues: list[str] = []
+    result = {
+        "bad_cap_date_headers": [],
+        "repaired_cap_dates": {},
+        "null_std_pack_rows": 0,
+        "null_std_pack_pns": [],
+        "unmatched_mrp_codes": [],
+        "zero_qty_rows": 0,
+        "issues": issues,
+    }
+
+    # Capacity date headers
+    if capacity_df is not None and not capacity_df.empty:
+        skip = {"line", "line group", "line grp", "linegroup"}
+        for c in capacity_df.columns:
+            c_text = str(c).strip()
+            if c_text.lower() in skip:
+                continue
+            # direct parse check
+            parsed_direct = pd.to_datetime(c_text, errors="coerce")
+            if pd.isna(parsed_direct):
+                parsed_repaired = to_date(c_text)
+                if parsed_repaired is None:
+                    result["bad_cap_date_headers"].append(c_text)
+                else:
+                    result["repaired_cap_dates"][c_text] = parsed_repaired.strftime("%m/%d/%Y")
+
+        if result["bad_cap_date_headers"]:
+            issues.append(
+                "⚠️ Capacity contains invalid week header(s): "
+                + ", ".join(result["bad_cap_date_headers"][:10])
+                + ("..." if len(result["bad_cap_date_headers"]) > 10 else "")
+            )
+
+    # Std Pack completeness (orders + master fallback)
+    sp_lookup = build_std_pack_lookup(sp_df) if sp_df is not None else {}
+    if data_df is not None and not data_df.empty and col_part in data_df.columns:
+        missing_rows = 0
+        missing_pns: set[str] = set()
+        for _, row in data_df.iterrows():
+            order_sp = to_number(row.get(col_std_pack, 0))
+            pn = str(row.get(col_part, "")).strip()
+            master_sp = to_number(sp_lookup.get(pn, 0))
+            if order_sp <= 0 and master_sp <= 0:
+                missing_rows += 1
+                if pn:
+                    missing_pns.add(pn)
+        result["null_std_pack_rows"] = int(missing_rows)
+        result["null_std_pack_pns"] = sorted(missing_pns)
+        if missing_rows > 0:
+            issues.append(
+                f"⚠️ {missing_rows} row(s) have no Std Pack in orders/master; they will use Std Pack = 1."
+            )
+
+    # Unmatched MRP codes vs capacity
+    if (
+        data_df is not None
+        and not data_df.empty
+        and capacity_df is not None
+        and not capacity_df.empty
+        and col_line in data_df.columns
+    ):
+        raw_codes = data_df[col_line].dropna().astype(str).str.strip().tolist()
+        valid_lines = set(normalize_line(v) for v in raw_codes if normalize_line(v) is not None)
+        cap_flat = build_cap_flat(
+            capacity_df,
+            preferred_line_col=capacity_line_col,
+            valid_lines=valid_lines,
+        )
+        matched_lines = {r["_Line"] for r in cap_flat}
+        unmatched_norm = valid_lines - matched_lines
+        unmatched_raw = sorted({c for c in raw_codes if normalize_line(c) in unmatched_norm})
+        result["unmatched_mrp_codes"] = unmatched_raw
+        if unmatched_raw:
+            issues.append(
+                "⚠️ Unmatched MRP code(s) using fallback capacity: "
+                + ", ".join(unmatched_raw[:15])
+                + ("..." if len(unmatched_raw) > 15 else "")
+            )
+
+    # Qty = 0 informational rows
+    if data_df is not None and not data_df.empty and col_qty in data_df.columns:
+        zero_qty = int((data_df[col_qty].apply(to_number) == 0).sum())
+        result["zero_qty_rows"] = zero_qty
+        if zero_qty > 0:
+            issues.append(f"ℹ️ {zero_qty} row(s) have Qty = 0.")
+
+    return result
+
+
 # ── Master table enrichment ──────────────────────────────────────────────────
 
 def build_hrs_lookup(

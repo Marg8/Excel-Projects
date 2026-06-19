@@ -23,6 +23,7 @@ from pq_logic import (
     build_std_pack_lookup,
     build_ma3_summary,
     capacity_comparison,
+    data_quality_report,
     run_query,
 )
 from bom_analysis import (
@@ -45,6 +46,8 @@ DEFAULT_HRS_SHEET  = "Hrs"
 DEFAULT_COST_SHEET = "Cost"
 DEFAULT_SP_SHEET   = "Std Pack"
 DEFAULT_BOM_SHEET  = "BOM"
+DEFAULT_STOCK_SHEET = "Stock"
+DEFAULT_RM_PO_SHEET = "RM_PO"
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -193,6 +196,20 @@ with col_g:
         index=_idx(bom_options, DEFAULT_BOM_SHEET, "BOM", "Bill of Materials"),
     )
 
+col_h, col_i, _ = st.columns(3)
+with col_h:
+    stock_options = ["(none)"] + sheet_names
+    stock_sheet = st.selectbox(
+        "Stock sheet", stock_options,
+        index=_idx(stock_options, DEFAULT_STOCK_SHEET, "Stock"),
+    )
+with col_i:
+    rm_po_options = ["(none)"] + sheet_names
+    rm_po_sheet = st.selectbox(
+        "RM_PO sheet", rm_po_options,
+        index=_idx(rm_po_options, DEFAULT_RM_PO_SHEET, "RM_PO", "RM PO"),
+    )
+
 capacity_line_col = "Line"
 
 # ── Load and preview data ─────────────────────────────────────────────────────
@@ -217,6 +234,12 @@ sp_master_df = pd.read_excel(buf, sheet_name=sp_master_sheet) if sp_master_sheet
 
 buf = io.BytesIO(xl_bytes)
 bom_df = pd.read_excel(buf, sheet_name=bom_sheet) if bom_sheet != "(none)" else None
+
+buf = io.BytesIO(xl_bytes)
+stock_df = pd.read_excel(buf, sheet_name=stock_sheet) if stock_sheet != "(none)" else None
+
+buf = io.BytesIO(xl_bytes)
+rm_po_df = pd.read_excel(buf, sheet_name=rm_po_sheet) if rm_po_sheet != "(none)" else None
 
 with st.expander(f"📋 Preview — {data_sheet}  ({len(data_df):,} rows)", expanded=False):
     st.dataframe(data_df.head(100), use_container_width=True)
@@ -334,6 +357,46 @@ else:
     base_cap_flat = []
     sim_df = pd.DataFrame(columns=["Line", "Week", "New Capacity"])
     cmp_df = pd.DataFrame(columns=["Line", "Week", "Original capacity", "Adjusted capacity", "Delta"])
+
+# ── Data Quality Check ────────────────────────────────────────────────────────
+st.subheader("3b · Data Quality Check")
+dq = data_quality_report(
+    data_df,
+    capacity_df=cap_df,
+    sp_df=sp_master_df,
+    col_qty=col_qty,
+    col_line=col_line,
+    col_std_pack=col_std_pack,
+    col_part="Product code",
+    capacity_line_col=capacity_line_col,
+)
+if dq["issues"]:
+    for msg in dq["issues"]:
+        if msg.startswith("🔴"):
+            st.error(msg)
+        elif msg.startswith("⚠️"):
+            st.warning(msg)
+        else:
+            st.info(msg)
+else:
+    st.success("✅ No data quality issues found — file is compatible.")
+
+with st.expander("🔍 Data quality detail", expanded=False):
+    col_dq1, col_dq2, col_dq3 = st.columns(3)
+    col_dq1.metric("Bad capacity date headers", len(dq.get("bad_cap_date_headers", [])))
+    col_dq2.metric("Rows with no Std Pack",     dq.get("null_std_pack_rows", 0),
+                   help="Will be scheduled with Std Pack = 1 (exact qty)")
+    col_dq3.metric("Unmatched MRP codes",        len(dq.get("unmatched_mrp_codes", [])),
+                   help="Will use median fallback capacity")
+    if dq.get("repaired_cap_dates"):
+        st.caption("Auto-repaired capacity date headers:")
+        st.json(dq["repaired_cap_dates"])
+    if dq.get("null_std_pack_pns"):
+        st.caption(f"Part numbers with no Std Pack ({len(dq['null_std_pack_pns'])}):")
+        st.write(", ".join(dq["null_std_pack_pns"][:30]) + ("…" if len(dq["null_std_pack_pns"]) > 30 else ""))
+    if dq.get("unmatched_mrp_codes"):
+        st.caption("MRP codes using fallback capacity:")
+        st.write(", ".join(sorted(dq["unmatched_mrp_codes"])))
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 st.subheader("4 · Run")
@@ -566,6 +629,21 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
             m3.metric("BOM Rows",           f"{len(bom_clean):,}")
             m4.metric("Total Comp. Demand", f"{total_demand:,.0f}")
 
+            has_supply_tables = (
+                (stock_df is not None and not stock_df.empty)
+                or (rm_po_df is not None and not rm_po_df.empty)
+            )
+            if has_supply_tables:
+                exploded_supply = compute_build_capability(
+                    exploded_base,
+                    stock_df=stock_df,
+                    rm_po_df=rm_po_df,
+                    week_col="ProductionWeek",
+                    week_date_col="ProductionWeekDate",
+                )
+            else:
+                exploded_supply = exploded_base.copy()
+
             # ── Tabs ──────────────────────────────────────────────────────────
             tab_demand, tab_stock, tab_capability, tab_cost = st.tabs([
                 "📦 Component Demand",
@@ -611,43 +689,19 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
             # ── Tab 2: Stock input & shortage ──────────────────────────────────
             with tab_stock:
                 st.markdown(
-                    "**Enter available stock for each component.** "
-                    "Leave as 0 to see maximum demand (no coverage)."
+                    "**CTB supply logic (weekly):** `Available Supply = Stock + cumulative RM_PO up to week`"
                 )
+                if not has_supply_tables:
+                    st.warning(
+                        "Load `Stock` and/or `RM_PO` sheets in Section 2 to enable time-based CTB. "
+                        "Without these sheets, CTB defaults to unconstrained demand."
+                    )
+                else:
+                    if "CTB_Flag" in exploded_supply.columns:
+                        hard_zero_rows = int((exploded_supply["CTB_Flag"] == False).sum())
+                        st.metric("Rows with CTB = 0 (no Stock and no PO by week)", f"{hard_zero_rows:,}")
 
-                # Build stock input table pre-populated with total demand
-                comp_demand_totals = (
-                    exploded_base.groupby(["Component", "Component_Desc"])["Comp_Demand"]
-                    .sum().reset_index()
-                    .rename(columns={"Comp_Demand": "Total_Demand"})
-                    .sort_values("Total_Demand", ascending=False)
-                )
-                comp_demand_totals["Available_Qty"] = 0.0
-                comp_demand_totals["Total_Demand"] = comp_demand_totals["Total_Demand"].round(2)
-
-                stock_edited = st.data_editor(
-                    comp_demand_totals[["Component", "Component_Desc", "Total_Demand", "Available_Qty"]],
-                    key="stock_input_table",
-                    num_rows="fixed",
-                    use_container_width=True,
-                    column_config={
-                        "Component":       st.column_config.TextColumn("Component", disabled=True),
-                        "Component_Desc":  st.column_config.TextColumn("Description", disabled=True),
-                        "Total_Demand":    st.column_config.NumberColumn("Total Demand", disabled=True, format="%.2f"),
-                        "Available_Qty":   st.column_config.NumberColumn("Available Qty", min_value=0, format="%.0f"),
-                    },
-                    hide_index=True,
-                )
-
-                stock_lookup_user = dict(
-                    zip(stock_edited["Component"].astype(str), stock_edited["Available_Qty"].fillna(0))
-                )
-                has_stock_input = stock_edited["Available_Qty"].sum() > 0
-
-                if has_stock_input:
-                    enriched = compute_build_capability(exploded_base, stock_lookup_user)
-
-                    short_df = shortage_report(enriched, week_col="ProductionWeek")
+                    short_df = shortage_report(exploded_supply, week_col="ProductionWeek")
                     if not short_df.empty:
                         st.markdown("#### ⚠️ Shortage Summary — Components × Week")
                         week_cols_s = [c for c in short_df.columns
@@ -660,31 +714,34 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
                             use_container_width=True,
                         )
                     else:
-                        st.success("✅ No shortages — all component demand is covered by available stock.")
-                else:
-                    st.info("Enter available quantities above and the shortage analysis will appear here.")
+                        st.success("✅ No shortages — component demand is covered by Stock + RM_PO timeline.")
+
+                    with st.expander("📄 Component-week CTB detail", expanded=False):
+                        cols_ctb = [c for c in [
+                            "Component", "Component_Desc", "ProductionWeek", "ProductionWeekDate",
+                            "Comp_Demand", "Stock_Qty", "Cum_PO_Qty", "Available_Supply",
+                            "Coverage_Pct", "CTB_Flag", "Shortage",
+                        ] if c in exploded_supply.columns]
+                        ctb_view = (
+                            exploded_supply[cols_ctb]
+                            .groupby([c for c in [
+                                "Component", "Component_Desc", "ProductionWeek", "ProductionWeekDate",
+                                "Stock_Qty", "Cum_PO_Qty", "Available_Supply", "Coverage_Pct", "CTB_Flag",
+                            ] if c in cols_ctb], as_index=False)
+                            .agg(Comp_Demand=("Comp_Demand", "sum"), Shortage=("Shortage", "sum"))
+                            .sort_values(["Component", "ProductionWeek"]) if "ProductionWeek" in cols_ctb else exploded_supply[cols_ctb]
+                        )
+                        st.dataframe(ctb_view, use_container_width=True, height=380)
 
             # ── Tab 3: Build capability ────────────────────────────────────────
             with tab_capability:
                 st.markdown("**Buildable FG quantity per part per week** — limited by most constrained component")
 
-                has_stock_cap = st.session_state.get("stock_input_table") is not None and (
-                    sum(
-                        (v.get("Available_Qty") or 0)
-                        for v in (st.session_state.get("stock_input_table", {}).get("edited_rows", {}).values())
-                    ) > 0
-                ) if "stock_input_table" in st.session_state else False
-
-                # Always compute capability — with user stock if provided, otherwise FG qty
-                cap_lookup = stock_lookup_user if has_stock_input else {}
-                if has_stock_input:
-                    enriched_cap = compute_build_capability(exploded_base, cap_lookup)
-                else:
-                    enriched_cap = exploded_base.copy()
+                enriched_cap = exploded_supply
 
                 capability_df = build_capability_summary(
                     enriched_cap, cost_dated_lookup,
-                    has_stock=has_stock_input,
+                    has_stock=has_supply_tables,
                 )
 
                 if not capability_df.empty:
@@ -697,7 +754,7 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
                     ca, cb, cc, cd = st.columns(4)
                     ca.metric("Total Scheduled Qty", f"{total_scheduled:,.0f}")
                     cb.metric("Total Buildable Qty",  f"{total_buildable:,.0f}",
-                              delta=f"{total_buildable-total_scheduled:+,.0f}" if has_stock_input else None)
+                              delta=f"{total_buildable-total_scheduled:+,.0f}" if has_supply_tables else None)
                     cc.metric("Avg Coverage %",       f"{avg_coverage:.1f}%")
                     cd.metric("Total Cost",           f"${total_cost:,.0f}")
 
@@ -718,7 +775,7 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
                         bld_fmt = {c: "{:,.0f}" for c in buildable_pvt.columns}
                         st.dataframe(
                             buildable_pvt.style.format(bld_fmt).background_gradient(
-                                cmap="Greens" if not has_stock_input else "RdYlGn"
+                                cmap="Greens" if not has_supply_tables else "RdYlGn"
                             ),
                             use_container_width=True, height=400,
                         )
@@ -737,7 +794,7 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
                         st.dataframe(capability_df[display_cols], use_container_width=True)
 
                     # Coverage heatmap pivot
-                    if has_stock_input and week_col_cap:
+                    if has_supply_tables and week_col_cap:
                         with st.expander("🗺️ Material Coverage % heatmap — FG × Week", expanded=True):
                             cov_pvt = capability_df.pivot_table(
                                 index=[pn_col_cap],
@@ -781,7 +838,7 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
                     buf_cap = io.BytesIO()
                     with pd.ExcelWriter(buf_cap, engine="openpyxl") as w:
                         capability_df.to_excel(w, sheet_name="Build Capability", index=False)
-                        if has_stock_input and not shortage_report(enriched_cap).empty:
+                        if has_supply_tables and not shortage_report(enriched_cap).empty:
                             shortage_report(enriched_cap).to_excel(w, sheet_name="Shortage Report", index=False)
                         demand_pvt = component_demand_pivot(exploded_base)
                         if not demand_pvt.empty:
