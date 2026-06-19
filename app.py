@@ -38,6 +38,8 @@ from bom_analysis import (
     run_build_analysis,
     build_rm_coverage_table,
     rm_coverage_to_excel,
+    build_line_output_plan,
+    line_output_to_excel,
 )
 
 WORKSPACE_FILE  = "MPS.xlsx"
@@ -647,12 +649,13 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
                 exploded_supply = exploded_base.copy()
 
             # ── Tabs ──────────────────────────────────────────────────────────
-            tab_demand, tab_stock, tab_capability, tab_cost, tab_coverage = st.tabs([
+            tab_demand, tab_stock, tab_capability, tab_cost, tab_coverage, tab_output = st.tabs([
                 "📦 Component Demand",
                 "🏷️ Stock Input & Shortage",
                 "🏗️ Build Capability (FG Output)",
                 "💰 Cost Traceability",
                 "📋 RM Coverage Report",
+                "🏭 Line Output Plan",
             ])
 
             # ── Tab 1: Component demand pivot ─────────────────────────────────
@@ -937,7 +940,7 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
 
                     # ── Top KPIs ──────────────────────────────────────────────
                     at_risk    = int((cov_kpi["Pct_Weeks_Covered"] < 100).sum())
-                    total_short = cov_kpi["Total_Shortage_Qty"].sum()
+                    peak_short  = cov_kpi["Peak_Shortage"].sum() if "Peak_Shortage" in cov_kpi.columns else 0
                     shortage_rows = cov_kpi[cov_kpi["First_Shortage_Week"] != "—"]
                     first_short = (
                         str(shortage_rows["First_Shortage_Week"].min())
@@ -949,8 +952,54 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
                               f"{at_risk} / {len(cov_kpi)}",
                               delta=None if at_risk == 0 else f"{at_risk} shortage",
                               delta_color="inverse")
-                    kb.metric("Total Shortage Qty",   f"{total_short:,.0f}")
+                    kb.metric("Total Peak Shortage",  f"{peak_short:,.0f}",
+                              help="Sum of the worst-week deficit per component — minimum qty to procure to resolve all shortages.")
                     kc.metric("First Shortage Week",  first_short)
+
+                    # ── Demand Audit ───────────────────────────────────────────
+                    with st.expander("🔍 Demand Derivation Audit — ScheduledQty × BOM Usage", expanded=False):
+                        sched_total   = int(result["ScheduledQty"].sum())
+                        raw_total     = int(result["QtyNum"].sum()) if "QtyNum" in result.columns else 0
+                        planned_total = int(result["QtyPlannedInput"].sum()) if "QtyPlannedInput" in result.columns else 0
+                        fgs_sched     = result["Product code"].nunique() if "Product code" in result.columns else 0
+                        fgs_bom       = bom_clean["Material"].nunique() if not bom_clean.empty else 0
+                        fgs_matched   = len(
+                            set(result["Product code"].dropna().astype(str))
+                            & set(bom_clean["Material"].dropna().astype(str))
+                        ) if not bom_clean.empty else 0
+
+                        st.markdown(
+                            "RM demand is derived **strictly** from the capacity-scheduled, "
+                            "std-pack-adjusted production plan. "
+                            "Formula: `RM Demand = ScheduledQty × BOM_Usage`"
+                        )
+                        col_a, col_b, col_c, col_d = st.columns(4)
+                        col_a.metric("Original Order Qty",    f"{raw_total:,}",
+                                     help="Sum of raw order quantities before any processing.")
+                        col_b.metric("After Std Pack Round",  f"{planned_total:,}",
+                                     help="Rounded up to nearest std pack multiple.")
+                        col_c.metric("ScheduledQty (CTB input)", f"{sched_total:,}",
+                                     help="Post-capacity leveling and week-split. Used as demand driver for RM.")
+                        col_d.metric("BOM Match Rate",
+                                     f"{100*fgs_matched//max(1,fgs_sched)}%",
+                                     help=f"{fgs_matched} of {fgs_sched} scheduled FGs found in BOM.")
+
+                        if not exploded_base.empty:
+                            audit_sample = (
+                                exploded_base
+                                .groupby(["FG","Component","BOM_Usage","ProductionWeek"], as_index=False)
+                                ["Comp_Demand"].sum()
+                                .head(8)
+                            )
+                            audit_sample["Formula"] = (
+                                audit_sample["FG"] + " × " + audit_sample["BOM_Usage"].map("{:.4g}".format)
+                                + " (BOM) = " + audit_sample["Comp_Demand"].map("{:,.0f}".format)
+                            )
+                            st.caption("Sample demand derivation rows (FG Qty × BOM Usage = Component Demand):")
+                            st.dataframe(
+                                audit_sample[["FG","Component","BOM_Usage","ProductionWeek","Comp_Demand","Formula"]],
+                                use_container_width=True, height=260,
+                            )
 
                     # ── Styled coverage table ─────────────────────────────────
                     display_cov = cov_df.copy()
@@ -1018,23 +1067,30 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
                     # ── KPI summary table ─────────────────────────────────────
                     with st.expander("📊 Per-Material KPI Summary", expanded=True):
                         kpi_fmt = {
-                            "Initial_Inventory":  "{:,.0f}",
-                            "Pct_Weeks_Covered":  "{:.1f}%",
-                            "Total_Shortage_Qty": "{:,.0f}",
+                            "Initial_Inventory": "{:,.0f}",
+                            "Pct_Weeks_Covered": "{:.1f}%",
+                            "Peak_Shortage":     "{:,.0f}",
+                            "Net_Deficit_Weeks": "{:,.0f}",
                         }
-                        styled_kpi = (
-                            cov_kpi.style
-                            .format(kpi_fmt)
-                            .background_gradient(
-                                subset=["Pct_Weeks_Covered"],
-                                cmap="RdYlGn", vmin=0, vmax=100,
-                            )
-                            .background_gradient(
-                                subset=["Total_Shortage_Qty"],
-                                cmap="Reds",
-                            )
+                        kpi_cols_show = [c for c in [
+                            "Component", "Description", "Initial_Inventory",
+                            "First_Shortage_Week", "Pct_Weeks_Covered",
+                            "Peak_Shortage", "Net_Deficit_Weeks",
+                        ] if c in cov_kpi.columns]
+                        grad_cols = [c for c in ["Pct_Weeks_Covered","Peak_Shortage","Net_Deficit_Weeks"]
+                                     if c in cov_kpi.columns]
+                        st.caption(
+                            "**Peak Shortage** = maximum deficit at any single week (minimum qty to procure).  "
+                            "**Net Deficit Weeks** = sum of running negative balances across all weeks (urgency index)."
                         )
-                        st.dataframe(styled_kpi, use_container_width=True)
+                        sty = cov_kpi[kpi_cols_show].style.format(kpi_fmt)
+                        if "Pct_Weeks_Covered" in grad_cols:
+                            sty = sty.background_gradient(
+                                subset=["Pct_Weeks_Covered"], cmap="RdYlGn", vmin=0, vmax=100
+                            )
+                        if "Peak_Shortage" in grad_cols:
+                            sty = sty.background_gradient(subset=["Peak_Shortage"], cmap="Reds")
+                        st.dataframe(sty, use_container_width=True)
 
                     # ── Excel download ────────────────────────────────────────
                     cov_excel = rm_coverage_to_excel(cov_df, cov_kpi)
@@ -1048,6 +1104,172 @@ if st.button("▶ Run Query", type="primary", use_container_width=True):
                         ),
                         use_container_width=True,
                     )
+
+            # ── Tab 6: Line × Week Output Plan ──────────────────────────────
+            with tab_output:
+                st.markdown(
+                    "**Production Output Plan — Line × Week** "
+                    "(`FG Output` = what CAN be built given CTB; `Shortage` = risk pcs)"
+                )
+
+                if "Line" not in result.columns:
+                    st.warning(
+                        "Column `Line` not found in schedule output. "
+                        "Check that the MPS sheet contains an MRP/Line column."
+                    )
+                else:
+                    out_plan_df, out_kpi_df = build_line_output_plan(
+                        result,
+                        capability_df=capability_df if not capability_df.empty else None,
+                        week_col="ProductionWeek",
+                        qty_col="ScheduledQty",
+                    )
+
+                    if out_plan_df.empty:
+                        st.info("No line output data could be generated.")
+                    else:
+                        # ── Top KPIs ─────────────────────────────────────────
+                        total_pl   = out_kpi_df["Total_Planned"].sum()
+                        total_out  = out_kpi_df["Total_FG_Output"].sum()
+                        total_sh   = out_kpi_df["Total_Shortage_Pcs"].sum()
+                        lines_risk = int((out_kpi_df["Total_Shortage_Pcs"] > 0).sum())
+                        pct_global = round(total_out / total_pl * 100, 1) if total_pl > 0 else 100.0
+
+                        oa, ob, oc, od = st.columns(4)
+                        oa.metric("Total Planned",      f"{total_pl:,.0f}")
+                        ob.metric("Total FG Output",    f"{total_out:,.0f}",
+                                  delta=f"{total_out - total_pl:+,.0f}" if has_supply_tables else None,
+                                  delta_color="inverse")
+                        oc.metric("Total Shortage Pcs", f"{total_sh:,.0f}",
+                                  delta_color="inverse")
+                        od.metric("Lines at Risk",
+                                  f"{lines_risk} / {len(out_kpi_df)}",
+                                  delta=f"{pct_global:.1f}% achievable",
+                                  delta_color="off")
+
+                        # ── 3-layer pivot: styled table ───────────────────────
+                        st.markdown("##### Production Output — Line × Production Week")
+                        info_cols_op = ["Line", "Line_Name", "Metric"]
+                        wk_cols_op   = [c for c in out_plan_df.columns if c not in info_cols_op]
+
+                        def _style_output_plan(df: pd.DataFrame) -> pd.DataFrame:
+                            """Return DataFrame of CSS strings aligned with df shape."""
+                            styles = pd.DataFrame("", index=df.index, columns=df.columns)
+                            for idx in df.index:
+                                metric = df.loc[idx, "Metric"] if "Metric" in df.columns else ""
+                                if metric == "FG Output":
+                                    bg, fg = "#C8E6C9", "#1B5E20"
+                                elif metric == "Shortage":
+                                    bg, fg = "#FFCDD2", "#B71C1C"
+                                else:
+                                    bg, fg = "#ECEFF1", "#263238"
+                                for col in df.columns:
+                                    styles.loc[idx, col] = (
+                                        f"background-color:{bg};color:{fg};font-weight:bold;"
+                                        if metric in ("FG Output", "Shortage")
+                                        else f"background-color:{bg};color:{fg};"
+                                    )
+                            return styles
+
+                        display_op = out_plan_df.copy()
+                        display_op = display_op.rename(columns={"Line_Name": "Line Name"})
+                        fmt_op = {c: "{:,.0f}" for c in wk_cols_op
+                                  if pd.api.types.is_numeric_dtype(out_plan_df[c])}
+
+                        st.dataframe(
+                            display_op.style
+                            .apply(_style_output_plan, axis=None)
+                            .format(fmt_op, na_rep="—"),
+                            use_container_width=True,
+                            height=min(60 + len(out_plan_df) * 36, 620),
+                        )
+
+                        # ── KPI breakdown by line ─────────────────────────────
+                        with st.expander("📊 Line KPI Breakdown", expanded=True):
+                            kpi_display = out_kpi_df.copy().rename(
+                                columns={"Line_Name": "Line Name",
+                                         "Total_Planned": "Planned",
+                                         "Total_FG_Output": "FG Output",
+                                         "Total_Shortage_Pcs": "Shortage Pcs",
+                                         "Pct_Achievable": "% Achievable",
+                                         "First_Shortage_Week": "First Shortage Wk",
+                                         "Recovery_Week": "Recovery Wk"}
+                            )
+                            def _style_kpi(df: pd.DataFrame) -> pd.DataFrame:
+                                styles = pd.DataFrame("", index=df.index, columns=df.columns)
+                                pct_col = "% Achievable" if "% Achievable" in df.columns else None
+                                sh_col  = "Shortage Pcs" if "Shortage Pcs" in df.columns else None
+                                for idx in df.index:
+                                    if pct_col:
+                                        try:
+                                            pct = float(df.loc[idx, pct_col])
+                                        except (TypeError, ValueError):
+                                            pct = 100.0
+                                        color = (
+                                            "#C8E6C9" if pct >= 95
+                                            else "#FFF9C4" if pct >= 80
+                                            else "#FFCDD2"
+                                        )
+                                        styles.loc[idx, pct_col] = f"background-color:{color};font-weight:bold;"
+                                    if sh_col:
+                                        try:
+                                            sh = float(df.loc[idx, sh_col])
+                                        except (TypeError, ValueError):
+                                            sh = 0.0
+                                        if sh > 0:
+                                            styles.loc[idx, sh_col] = "background-color:#FFCDD2;color:#B71C1C;font-weight:bold;"
+                                return styles
+
+                            fmt_kpi = {
+                                "Planned":    "{:,.0f}",
+                                "FG Output":  "{:,.0f}",
+                                "Shortage Pcs": "{:,.0f}",
+                                "% Achievable": "{:.1f}%",
+                            }
+                            st.dataframe(
+                                kpi_display.style
+                                .apply(_style_kpi, axis=None)
+                                .format(fmt_kpi, na_rep="—"),
+                                use_container_width=True,
+                            )
+
+                        # ── Separate pivots: Planned / FG Output / Shortage ───
+                        with st.expander("📋 Pivot: Planned vs FG Output vs Shortage (split view)", expanded=False):
+                            for metric_label, fill_hex in [
+                                ("Planned",   None),
+                                ("FG Output", "#C8E6C9"),
+                                ("Shortage",  "#FFCDD2"),
+                            ]:
+                                subset = out_plan_df[out_plan_df["Metric"] == metric_label].copy()
+                                if subset.empty:
+                                    continue
+                                pvt = subset.drop(columns=["Metric"]).set_index(["Line", "Line_Name"])
+                                pvt.index.names = ["Line", "Line Name"]
+                                st.markdown(f"**{metric_label}**")
+                                fmt_pvt = {c: "{:,.0f}" for c in pvt.columns
+                                           if pd.api.types.is_numeric_dtype(pvt[c])}
+                                if fill_hex:
+                                    st.dataframe(
+                                        pvt.style.format(fmt_pvt, na_rep="—")
+                                        .map(lambda _: f"background-color:{fill_hex};"),
+                                        use_container_width=True,
+                                    )
+                                else:
+                                    st.dataframe(pvt.style.format(fmt_pvt, na_rep="—"),
+                                                 use_container_width=True)
+
+                        # ── Excel download ────────────────────────────────────
+                        out_xlsx = line_output_to_excel(out_plan_df, out_kpi_df)
+                        st.download_button(
+                            "⬇️ Line Output Plan Excel (Formatted)",
+                            data=out_xlsx,
+                            file_name="line_output_plan.xlsx",
+                            mime=(
+                                "application/vnd.openxmlformats-"
+                                "officedocument.spreadsheetml.sheet"
+                            ),
+                            use_container_width=True,
+                        )
 
 # ── M code viewer ─────────────────────────────────────────────────────────────
 with st.expander("📝 Current M code (Excel.xlsx)", expanded=False):

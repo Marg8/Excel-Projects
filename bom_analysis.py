@@ -179,6 +179,23 @@ def parse_bom(
     )
     out = out[out["Alt_BOM"] == chosen_alt]
 
+    # Collapse duplicate Material×Component entries by summing BOM_Usage.
+    # In SAP BOM, the same component can appear in multiple operations at the
+    # same level and Alt BOM — summing gives correct total usage per FG.
+    out = (
+        out.groupby(
+            ["Material", "Component"],
+            as_index=False, sort=False,
+        ).agg(
+            Component_Desc=("Component_Desc", "first"),
+            Material_Desc=("Material_Desc",  "first"),
+            BOM_Usage=("BOM_Usage",  "sum"),
+            Alt_BOM=("Alt_BOM",   "first"),
+            BOM_Level=("BOM_Level", "first"),
+            MRP=("MRP",       "first"),
+        )
+    )
+
     return out.reset_index(drop=True)
 
 
@@ -299,15 +316,23 @@ def _build_weekly_po_table(
     df.columns = [str(c).strip() for c in df.columns]
 
     comp_col = _col(df, ["Component", "Material", "PN", "Part Number", "Part"])
-    qty_col = _col(df, ["PO Qty", "Qty", "Quantity", "Open Qty", "Order Qty"])
-    date_col = _col(df, ["PO Date", "Due Date", "Delivery Date", "Date", "Week Date", "Requested date"])
+    qty_col  = _col(df, [
+        "Rec./reqd.qty", "Rec./reqd.qty2",
+        "PO Qty", "Qty", "Quantity", "Open Qty", "Order Qty",
+    ])
+    # Del/finish = confirmed delivery date from SAP MRP element.
+    # Fallback chain: Del/finish → Delivery Date → Due Date → PO Date → Date.
+    date_col = _col(df, [
+        "Del/finish", "Del/Finish", "Delivery Date", "Due Date",
+        "PO Date", "Week Date", "Date", "Requested date",
+    ])
 
     if comp_col is None or qty_col is None or date_col is None:
         return pd.DataFrame(columns=["Component", "PO_WeekDate", "PO_Qty"])
 
     out = pd.DataFrame()
-    out["Component"] = df[comp_col].astype(str).str.strip()
-    out["PO_Qty"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0.0)
+    out["Component"]   = df[comp_col].astype(str).str.strip()
+    out["PO_Qty"]      = pd.to_numeric(df[qty_col], errors="coerce").fillna(0.0)
     out["PO_WeekDate"] = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
 
     out = out[
@@ -638,29 +663,40 @@ def build_rm_coverage_table(
                     uom_lookup[c] = u
 
     # ── 4. Weekly receipts from RM_PO ─────────────────────────────────────────
-    # Map each PO to the first production week whose date >= PO date.
-    receipts_map: dict[tuple, float] = {}
+    # Map each PO Del/finish date to the production week that contains or
+    # immediately follows that date (first week_date >= Del/finish).
+    # This is the correct MRP receipt logic: material available from Del/finish
+    # onward, so it feeds the first production week that falls on or after.
+    receipts_map: dict[tuple, float] = {}  # (component, week_label) → qty
     if rm_po_df is not None and not rm_po_df.empty and week_dates_lookup:
         po_weekly = _build_weekly_po_table(rm_po_df)
         if not po_weekly.empty:
-            sorted_weeks = sorted(week_dates_lookup.keys(),
-                                  key=lambda w: pd.to_datetime(week_dates_lookup[w], errors="coerce"))
-            sorted_wdts = [pd.to_datetime(week_dates_lookup[w], errors="coerce").normalize()
-                           for w in sorted_weeks]
+            sorted_weeks = sorted(
+                week_dates_lookup.keys(),
+                key=lambda w: pd.to_datetime(week_dates_lookup[w], errors="coerce"),
+            )
+            sorted_wdts = [
+                pd.to_datetime(week_dates_lookup[w], errors="coerce").normalize()
+                for w in sorted_weeks
+            ]
 
             for _, po_row in po_weekly.iterrows():
-                comp = str(po_row["Component"]).strip()
+                comp  = str(po_row["Component"]).strip()
                 po_dt = pd.to_datetime(po_row["PO_WeekDate"], errors="coerce")
                 if pd.isna(po_dt):
                     continue
                 po_dt = po_dt.normalize()
+
+                # First production week whose start date is >= Del/finish
                 matched_wk = None
                 for wk, wk_dt in zip(sorted_weeks, sorted_wdts):
                     if pd.notna(wk_dt) and wk_dt >= po_dt:
                         matched_wk = wk
                         break
+                # If Del/finish is after the last production week, attach to last
                 if matched_wk is None:
                     matched_wk = sorted_weeks[-1]
+
                 key = (comp, matched_wk)
                 receipts_map[key] = receipts_map.get(key, 0.0) + float(po_row["PO_Qty"])
 
@@ -685,12 +721,13 @@ def build_rm_coverage_table(
         balance = initial_inv
         first_shortage_wk = None
         shortage_count = 0
-        total_shortage_qty = 0.0
+        net_deficit_weeks = 0.0   # sum of running negative balances (MRP urgency index)
+        peak_shortage     = 0.0   # maximum single-point deficit (actual procurement gap)
 
         for wk in weeks:
-            demand_val = float(comp_row.get(wk, 0) or 0)
+            demand_val   = float(comp_row.get(wk, 0) or 0)
             receipts_val = receipts_map.get((comp, wk), 0.0)
-            balance = balance + receipts_val - demand_val
+            balance      = balance + receipts_val - demand_val
 
             row_d[wk] = demand_val
             row_r[wk] = receipts_val
@@ -699,19 +736,21 @@ def build_rm_coverage_table(
             if balance < 0:
                 if first_shortage_wk is None:
                     first_shortage_wk = wk
-                shortage_count += 1
-                total_shortage_qty += abs(balance)
+                shortage_count    += 1
+                net_deficit_weeks += abs(balance)
+                peak_shortage      = max(peak_shortage, abs(balance))
 
         coverage_rows.extend([row_d, row_r, row_b])
 
         pct_covered = round((len(weeks) - shortage_count) / len(weeks) * 100, 1) if weeks else 100.0
         kpi_rows.append({
-            "Component":          comp,
-            "Description":        desc,
-            "Initial_Inventory":  initial_inv,
+            "Component":           comp,
+            "Description":         desc,
+            "Initial_Inventory":   initial_inv,
             "First_Shortage_Week": first_shortage_wk if first_shortage_wk is not None else "—",
-            "Pct_Weeks_Covered":  pct_covered,
-            "Total_Shortage_Qty": round(total_shortage_qty, 0),
+            "Pct_Weeks_Covered":   pct_covered,
+            "Peak_Shortage":       round(peak_shortage, 0),       # actionable: minimum qty to procure now
+            "Net_Deficit_Weeks":   round(net_deficit_weeks, 0),   # urgency index (sum of negative balances)
         })
 
     coverage_df = pd.DataFrame(coverage_rows)
@@ -833,6 +872,267 @@ def rm_coverage_to_excel(
             cell.alignment = CENTER
         for _, row in kpi_df.iterrows():
             ws2.append(list(row.values))
+
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ── 9. Line × Week production output plan (CTB → FG Output) ──────────────────
+
+def build_line_output_plan(
+    result_df: pd.DataFrame,
+    capability_df: pd.DataFrame | None = None,
+    week_col: str = "ProductionWeek",
+    qty_col: str = "ScheduledQty",
+    line_col: str = "Line",
+    line_name_col: str = "Line Name",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Line × Week production output plan.
+
+    Planned  = sum(ScheduledQty) from result_df per Line × Week.
+               This uses the already-capacity-constrained, std-pack-rounded schedule
+               from run_query — the ground truth for what was planned.
+
+    FG Output = Planned constrained by CTB (from capability_df).
+               If capability_df is None or a line/week has no BOM match,
+               FG Output defaults to Planned (no material constraint known).
+
+    Shortage = Planned − FG Output
+
+    Recovery_Week = first week after first shortage where Shortage == 0.
+    """
+    if result_df is None or result_df.empty or line_col not in result_df.columns:
+        return pd.DataFrame(), pd.DataFrame()
+    if week_col not in result_df.columns or qty_col not in result_df.columns:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # ── 1. Planned from result_df (ScheduledQty with capacity + std pack) ────
+    line_name_map: dict = {}
+    if line_name_col in result_df.columns:
+        line_name_map = (
+            result_df.dropna(subset=[line_name_col])
+            .groupby(line_col)[line_name_col]
+            .first()
+            .to_dict()
+        )
+
+    planned_agg = (
+        result_df.groupby([line_col, week_col], sort=True)[qty_col]
+        .sum()
+        .reset_index()
+        .rename(columns={line_col: "Line", qty_col: "Planned"})
+    )
+
+    weeks: list = sorted(planned_agg[week_col].unique())
+    lines: list = sorted(planned_agg["Line"].unique())
+
+    # ── 2. FG Output from capability_df (CTB-constrained buildable per Line × Week)
+    buildable_agg: dict[tuple, float] = {}
+    if capability_df is not None and not capability_df.empty and "Line" in capability_df.columns:
+        bq_col = "Buildable_Qty" if "Buildable_Qty" in capability_df.columns else None
+        pq_col = "FG_Scheduled_Qty" if "FG_Scheduled_Qty" in capability_df.columns else None
+        if bq_col and pq_col:
+            cap = capability_df.copy()
+            cap["_buildable"] = pd.to_numeric(cap[bq_col], errors="coerce").fillna(0.0)
+            cap["_planned_cap"] = pd.to_numeric(cap[pq_col], errors="coerce").fillna(0.0)
+            cap["_buildable"] = cap[["_planned_cap", "_buildable"]].min(axis=1)
+            for (line, wk), g in cap.groupby(["Line", week_col]):
+                buildable_agg[(line, wk)] = float(g["_buildable"].sum())
+
+    # ── 3. Build stacked output ───────────────────────────────────────────────
+    planned_idx = planned_agg.set_index(["Line", week_col])["Planned"]
+
+    agg_dict: dict[tuple, dict] = {
+        (line, wk): {"Planned": float(planned_idx.get((line, wk), 0.0))}
+        for line in lines for wk in weeks
+    }
+    for (line, wk), val in agg_dict.items():
+        planned  = val["Planned"]
+        if buildable_agg:
+            # Use CTB-based buildable; cap at planned; default to planned when line/week missing
+            fg_out = min(planned, buildable_agg.get((line, wk), planned))
+        else:
+            fg_out = planned
+        val["FG_Output"] = fg_out
+        val["Shortage"]  = max(0.0, planned - fg_out)
+
+    plan_rows: list[dict] = []
+    kpi_rows:  list[dict] = []
+
+    for line in lines:
+        lname = line_name_map.get(line, "")
+
+        row_p: dict = {"Line": line, "Line_Name": lname, "Metric": "Planned"}
+        row_o: dict = {"Line": line, "Line_Name": lname, "Metric": "FG Output"}
+        row_s: dict = {"Line": line, "Line_Name": lname, "Metric": "Shortage"}
+
+        first_shortage_wk = None
+        recovery_wk       = None
+        found_shortage    = False
+        total_planned = total_output = total_shortage = 0.0
+
+        for wk in weeks:
+            vals     = agg_dict.get((line, wk), {"Planned": 0.0, "FG_Output": 0.0, "Shortage": 0.0})
+            planned  = vals["Planned"]
+            output   = vals["FG_Output"]
+            shortage = vals["Shortage"]
+
+            row_p[wk] = planned
+            row_o[wk] = output
+            row_s[wk] = shortage if shortage > 0 else 0.0
+
+            total_planned  += planned
+            total_output   += output
+            total_shortage += shortage
+
+            if shortage > 0:
+                found_shortage = True
+                if first_shortage_wk is None:
+                    first_shortage_wk = wk
+            elif found_shortage and shortage == 0 and recovery_wk is None:
+                recovery_wk = wk
+
+        plan_rows.extend([row_p, row_o, row_s])
+        pct = round(total_output / total_planned * 100, 1) if total_planned > 0 else 100.0
+
+        kpi_rows.append({
+            "Line":                line,
+            "Line_Name":           lname,
+            "Total_Planned":       round(total_planned,  0),
+            "Total_FG_Output":     round(total_output,   0),
+            "Total_Shortage_Pcs":  round(total_shortage, 0),
+            "Pct_Achievable":      pct,
+            "First_Shortage_Week": first_shortage_wk if first_shortage_wk is not None else "—",
+            "Recovery_Week":       (
+                recovery_wk if recovery_wk is not None
+                else ("No recovery yet" if found_shortage else "—")
+            ),
+        })
+
+    plan_df = pd.DataFrame(plan_rows)
+    kpi_df  = pd.DataFrame(kpi_rows)
+    return plan_df, kpi_df
+
+
+def line_output_to_excel(
+    plan_df: pd.DataFrame,
+    kpi_df:  pd.DataFrame,
+) -> bytes:
+    """
+    Returns a formatted xlsx file with:
+      - Sheet 'Line Output Plan'  : dark-green header, green FG Output rows, red Shortage rows
+      - Sheet 'Line KPI'          : per-line KPI summary
+    """
+    import io as _io
+    from openpyxl import Workbook
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    buf = _io.BytesIO()
+    wb  = Workbook()
+    ws  = wb.active
+    ws.title = "Line Output Plan"
+
+    HDR_FILL  = PatternFill("solid", fgColor="1B5E20")
+    HDR_FONT  = Font(bold=True, color="FFFFFF")
+    GRN_FILL  = PatternFill("solid", fgColor="C8E6C9")
+    GRN_FONT  = Font(bold=True, color="1B5E20")
+    RED_FILL  = PatternFill("solid", fgColor="FFCDD2")
+    RED_FONT  = Font(bold=True, color="B71C1C")
+    PLN_FILL  = PatternFill("solid", fgColor="ECEFF1")
+    LBL_FILL  = PatternFill("solid", fgColor="CFD8DC")
+    NUM_FMT   = "#,##0"
+    RIGHT     = Alignment(horizontal="right")
+    CENTER    = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    LEFT      = Alignment(horizontal="left")
+    BOT_BDR   = Border(bottom=Side(style="medium", color="9E9E9E"))
+
+    if plan_df.empty:
+        wb.save(buf)
+        return buf.getvalue()
+
+    info_cols = ["Line", "Line_Name", "Metric"]
+    week_keys = [c for c in plan_df.columns if c not in info_cols]
+
+    headers = ["Line", "Line Name", "Metric"] + [str(w) for w in week_keys]
+    ws.append(headers)
+    for ci in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=ci)
+        cell.fill = HDR_FILL
+        cell.font = HDR_FONT
+        cell.alignment = CENTER
+    ws.freeze_panes = "D2"
+
+    prev_line = None
+    for _, row in plan_df.iterrows():
+        metric = str(row.get("Metric", ""))
+        line   = str(row.get("Line", ""))
+
+        values = [line, row.get("Line_Name", ""), metric] + [row.get(wk, 0) for wk in week_keys]
+        ws.append(values)
+        ri = ws.max_row
+
+        # Suppress repeated Line/Line Name for rows 2-3 of each group
+        if line == prev_line:
+            ws.cell(row=ri, column=1).value = ""
+            ws.cell(row=ri, column=2).value = ""
+        prev_line = line
+
+        # Choose fill/font by metric
+        if metric == "FG Output":
+            row_fill, row_font = GRN_FILL, GRN_FONT
+        elif metric == "Shortage":
+            row_fill, row_font = RED_FILL, RED_FONT
+        else:
+            row_fill, row_font = PLN_FILL, None
+
+        for ci in range(1, len(headers) + 1):
+            cell = ws.cell(row=ri, column=ci)
+            if ci <= 3:
+                cell.fill = LBL_FILL if ci == 3 else row_fill
+                cell.alignment = LEFT
+            else:
+                cell.fill = row_fill
+                cell.font = row_font
+                cell.number_format = NUM_FMT
+                cell.alignment = RIGHT
+                # Zero shortage → blank for cleanliness
+                if metric == "Shortage" and (cell.value or 0) == 0:
+                    cell.value = None
+
+        # Bottom border after Shortage row (last of each group)
+        if metric == "Shortage":
+            for ci in range(1, len(headers) + 1):
+                ws.cell(row=ri, column=ci).border = BOT_BDR
+
+    # Column widths
+    ws.column_dimensions["A"].width = 12
+    ws.column_dimensions["B"].width = 26
+    ws.column_dimensions["C"].width = 14
+    for i in range(1, len(week_keys) + 1):
+        ws.column_dimensions[get_column_letter(3 + i)].width = 10
+
+    # KPI sheet
+    if not kpi_df.empty:
+        ws2 = wb.create_sheet("Line KPI")
+        ws2.append(list(kpi_df.columns))
+        for ci in range(1, len(kpi_df.columns) + 1):
+            cell = ws2.cell(row=1, column=ci)
+            cell.fill = HDR_FILL
+            cell.font = HDR_FONT
+            cell.alignment = CENTER
+        for _, row in kpi_df.iterrows():
+            ws2.append(list(row.values))
+            ri = ws2.max_row
+            pct = row.get("Pct_Achievable", 100.0)
+            try:
+                pct = float(pct)
+            except (TypeError, ValueError):
+                pct = 100.0
+            color = "C8E6C9" if pct >= 95 else ("FFF9C4" if pct >= 80 else "FFCDD2")
+            pct_col = list(kpi_df.columns).index("Pct_Achievable") + 1
+            ws2.cell(row=ri, column=pct_col).fill = PatternFill("solid", fgColor=color)
 
     wb.save(buf)
     return buf.getvalue()
